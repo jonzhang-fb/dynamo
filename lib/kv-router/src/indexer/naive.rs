@@ -20,8 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{KvIndexerInterface, KvRouterError};
 use crate::protocols::{
-    KvCacheEventData, LocalBlockHash, OverlapScores, RouterEvent, TokensWithHashes, WorkerId,
-    WorkerWithDpRank,
+    ExternalSequenceBlockHash, KvCacheEventData, LocalBlockHash, OverlapScores, RouterEvent,
+    TokensWithHashes, WorkerId, WorkerWithDpRank,
 };
 
 // ============================================================================
