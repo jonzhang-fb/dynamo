@@ -55,9 +55,9 @@ use crate::{
         approx::PruneConfig,
         indexer::{GetWorkersRequest, KvIndexer, KvIndexerInterface, KvRouterError},
         protocols::{
-            BlockExtraInfo, DpRank, LocalBlockHash, OverlapScores, RouterEvent, RouterRequest,
-            RouterResponse, TokensWithHashes, WorkerId, WorkerWithDpRank,
-            compute_block_hash_for_seq,
+            BlockExtraInfo, DpRank, ExternalSequenceBlockHash, LocalBlockHash, OverlapScores,
+            RouterEvent, RouterRequest, RouterResponse, TokensWithHashes, WorkerId,
+            WorkerWithDpRank, compute_block_hash_for_seq,
         },
         remote_indexer::RemoteIndexer,
         scheduler::{KvScheduler, PotentialLoad},
@@ -215,13 +215,26 @@ impl Indexer {
         &self,
         sequence: Vec<LocalBlockHash>,
     ) -> Result<OverlapScores, KvRouterError> {
+        self.find_matches_anchored(sequence, None).await
+    }
+
+    pub(crate) async fn find_matches_anchored(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Result<OverlapScores, KvRouterError> {
         match self {
-            Indexer::KvIndexer(indexer) => indexer.find_matches(sequence).await,
-            Indexer::Concurrent(tpi) => tpi.find_matches(sequence).await,
-            Indexer::Remote(remote) => remote.find_matches(sequence).await.map_err(|e| {
-                tracing::warn!(error = %e, "Remote indexer query failed");
-                KvRouterError::IndexerOffline
-            }),
+            Indexer::KvIndexer(indexer) => {
+                indexer.find_matches_anchored(sequence, start_anchor).await
+            }
+            Indexer::Concurrent(tpi) => tpi.find_matches_anchored(sequence, start_anchor).await,
+            Indexer::Remote(remote) => remote
+                .find_matches_anchored(sequence, start_anchor)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "Remote indexer query failed");
+                    KvRouterError::IndexerOffline
+                }),
             Indexer::None => Ok(OverlapScores::new()),
         }
     }

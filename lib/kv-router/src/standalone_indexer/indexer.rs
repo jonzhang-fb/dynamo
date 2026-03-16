@@ -9,7 +9,9 @@ use tokio_util::sync::CancellationToken;
 use crate::ConcurrentRadixTree;
 use crate::ThreadPoolIndexer;
 use crate::indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics};
-use crate::protocols::{LocalBlockHash, OverlapScores, RouterEvent, WorkerId};
+use crate::protocols::{
+    ExternalSequenceBlockHash, LocalBlockHash, OverlapScores, RouterEvent, WorkerId,
+};
 
 #[derive(Clone)]
 pub enum Indexer {
@@ -40,9 +42,23 @@ impl Indexer {
     }
 
     pub async fn find_matches(&self, hashes: Vec<LocalBlockHash>) -> Result<OverlapScores> {
+        self.find_matches_anchored(hashes, None).await
+    }
+
+    pub async fn find_matches_anchored(
+        &self,
+        hashes: Vec<LocalBlockHash>,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Result<OverlapScores> {
         match self {
-            Indexer::Single(idx) => idx.find_matches(hashes).await.map_err(Into::into),
-            Indexer::Concurrent(idx) => idx.find_matches(hashes).await.map_err(Into::into),
+            Indexer::Single(idx) => idx
+                .find_matches_anchored(hashes, start_anchor)
+                .await
+                .map_err(Into::into),
+            Indexer::Concurrent(idx) => idx
+                .find_matches_anchored(hashes, start_anchor)
+                .await
+                .map_err(Into::into),
         }
     }
 

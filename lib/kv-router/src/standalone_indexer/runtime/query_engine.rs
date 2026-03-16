@@ -31,7 +31,11 @@ impl AsyncEngine<SingleIn<IndexerQueryRequest>, ManyOut<IndexerQueryResponse>, a
         };
 
         let response = match self.registry.get_indexer(&key) {
-            Some(entry) => match entry.indexer.find_matches(req.block_hashes).await {
+            Some(entry) => match entry
+                .indexer
+                .find_matches_anchored(req.block_hashes, req.start_anchor)
+                .await
+            {
                 Ok(scores) => IndexerQueryResponse::Scores(scores.into()),
                 Err(err) => IndexerQueryResponse::Error(err.to_string()),
             },

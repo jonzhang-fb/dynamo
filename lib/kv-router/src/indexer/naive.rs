@@ -171,6 +171,14 @@ impl KvIndexerInterface for NaiveNestedMap {
             .map_err(|_| KvRouterError::IndexerDroppedRequest)
     }
 
+    async fn find_matches_anchored(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        _start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Result<OverlapScores, KvRouterError> {
+        self.find_matches(sequence).await
+    }
+
     async fn find_matches_for_request(
         &self,
         _tokens: &[u32],
@@ -380,6 +388,14 @@ impl KvIndexerInterface for InvertedIndex {
         reply_rx
             .await
             .map_err(|_| KvRouterError::IndexerDroppedRequest)
+    }
+
+    async fn find_matches_anchored(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        _start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Result<OverlapScores, KvRouterError> {
+        self.find_matches(sequence).await
     }
 
     async fn find_matches_for_request(

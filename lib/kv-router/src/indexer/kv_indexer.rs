@@ -257,7 +257,11 @@ impl KvIndexer {
 
                             #[cfg(feature = "bench")]
                             let process_start = Instant::now();
-                            let matches = trie.find_matches(req.sequence, req.early_exit);
+                            let matches = trie.find_matches_anchored(
+                                req.sequence,
+                                req.early_exit,
+                                req.start_anchor,
+                            );
                             #[cfg(feature = "bench")]
                             let process_time = process_start.elapsed();
 
@@ -367,11 +371,19 @@ impl KvIndexerInterface for KvIndexer {
         &self,
         sequence: Vec<LocalBlockHash>,
     ) -> Result<OverlapScores, KvRouterError> {
+        self.find_matches_anchored(sequence, None).await
+    }
+
+    async fn find_matches_anchored(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Result<OverlapScores, KvRouterError> {
         #[cfg(feature = "bench")]
         let start = Instant::now();
         let seq_len = sequence.len();
         let (resp_tx, resp_rx) = oneshot::channel();
-        let req = MatchRequest::new(sequence, false, resp_tx);
+        let req = MatchRequest::new(sequence, false, start_anchor, resp_tx);
 
         if let Err(e) = self.match_tx.send(req).await {
             tracing::error!(

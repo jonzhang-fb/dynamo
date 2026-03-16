@@ -22,6 +22,14 @@ pub trait KvIndexerInterface {
         sequence: Vec<LocalBlockHash>,
     ) -> Result<OverlapScores, KvRouterError>;
 
+    /// Find matches for a given sequence of `LocalBlockHash`es, optionally anchored at a
+    /// previously stored block.
+    async fn find_matches_anchored(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Result<OverlapScores, KvRouterError>;
+
     /// Find matches for a given sequence of tokens.
     ///
     /// ### Arguments
@@ -110,6 +118,14 @@ pub trait SyncIndexer: Send + Sync + 'static {
 
     /// Find matches for a sequence of block hashes.
     fn find_matches(&self, sequence: &[LocalBlockHash], early_exit: bool) -> OverlapScores;
+
+    /// Find matches for a sequence of block hashes, optionally anchored at an existing block.
+    fn find_matches_anchored(
+        &self,
+        sequence: &[LocalBlockHash],
+        early_exit: bool,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> OverlapScores;
 
     /// Dump events directly from the shared structure, bypassing worker channels.
     /// Returns `Some(events)` for backends whose tree state is fully shared (e.g.

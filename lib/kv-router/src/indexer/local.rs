@@ -258,6 +258,16 @@ impl KvIndexerInterface for LocalKvIndexer {
         self.indexer.find_matches(sequence).await
     }
 
+    async fn find_matches_anchored(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Result<OverlapScores, KvRouterError> {
+        self.indexer
+            .find_matches_anchored(sequence, start_anchor)
+            .await
+    }
+
     async fn find_matches_for_request(
         &self,
         tokens: &[u32],

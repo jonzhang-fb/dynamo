@@ -11,7 +11,7 @@ use dynamo_runtime::{
 
 use dynamo_kv_router::{
     indexer::{IndexerQueryRequest, IndexerQueryResponse, KV_INDEXER_QUERY_ENDPOINT},
-    protocols::{LocalBlockHash, OverlapScores},
+    protocols::{ExternalSequenceBlockHash, LocalBlockHash, OverlapScores},
 };
 
 /// A remote indexer that queries a standalone KV indexer via the request plane.
@@ -46,10 +46,19 @@ impl RemoteIndexer {
     }
 
     pub async fn find_matches(&self, block_hashes: Vec<LocalBlockHash>) -> Result<OverlapScores> {
+        self.find_matches_anchored(block_hashes, None).await
+    }
+
+    pub async fn find_matches_anchored(
+        &self,
+        block_hashes: Vec<LocalBlockHash>,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Result<OverlapScores> {
         let request = IndexerQueryRequest {
             model_name: self.model_name.clone(),
             namespace: self.namespace.clone(),
             block_hashes,
+            start_anchor,
         };
         let mut stream: ManyOut<IndexerQueryResponse> =
             self.router.round_robin(SingleIn::new(request)).await?;

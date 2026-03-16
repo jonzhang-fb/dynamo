@@ -94,7 +94,11 @@ impl SeqEntry {
     /// Get workers for a specific seq_hash.
     fn get(&self, seq_hash: ExternalSequenceBlockHash) -> Option<&FxHashSet<WorkerWithDpRank>> {
         match self {
-            Self::Single(existing_hash, workers) if *existing_hash == seq_hash => Some(workers),
+            Self::Single(existing_hash, workers)
+                if *existing_hash == seq_hash && !workers.is_empty() =>
+            {
+                Some(workers)
+            }
             Self::Single(_, _) => None,
             Self::Multi(map) => map.get(&seq_hash),
         }
@@ -109,6 +113,8 @@ pub type LevelIndex = FxHashMap<ExternalSequenceBlockHash, (usize, LocalBlockHas
 /// All methods are synchronous and thread-safe.
 pub struct PositionalIndexer {
     index: DashMap<(usize, LocalBlockHash), SeqEntry, FxBuildHasher>,
+
+    anchor_lookup: DashMap<ExternalSequenceBlockHash, (usize, LocalBlockHash), FxBuildHasher>,
 
     tree_sizes: DashMap<WorkerWithDpRank, AtomicUsize, FxBuildHasher>,
 
@@ -127,6 +133,7 @@ impl PositionalIndexer {
 
         Self {
             index: DashMap::with_hasher(FxBuildHasher),
+            anchor_lookup: DashMap::with_hasher(FxBuildHasher),
             tree_sizes: DashMap::with_hasher(FxBuildHasher),
             jump_size,
         }
@@ -172,6 +179,15 @@ impl SyncIndexer for PositionalIndexer {
 
     fn find_matches(&self, sequence: &[LocalBlockHash], early_exit: bool) -> OverlapScores {
         self.jump_search_matches(sequence, early_exit)
+    }
+
+    fn find_matches_anchored(
+        &self,
+        sequence: &[LocalBlockHash],
+        early_exit: bool,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> OverlapScores {
+        self.jump_search_matches_anchored(sequence, early_exit, start_anchor)
     }
 }
 
@@ -257,6 +273,7 @@ impl PositionalIndexer {
 
             // Insert into worker_blocks: worker -> seq_hash -> (position, local_hash)
             worker_blocks_entry.insert(seq_hash, (position, local_hash));
+            self.anchor_lookup.insert(seq_hash, (position, local_hash));
         }
 
         match self.tree_sizes.get(&worker) {
@@ -309,9 +326,7 @@ impl PositionalIndexer {
                 return Err(KvCacheEventError::BlockNotFound);
             };
 
-            if let Some(mut entry) = self.index.get_mut(&(position, local_hash)) {
-                let _ = entry.remove(*seq_hash, worker);
-            }
+            self.remove_index_entry(position, local_hash, *seq_hash, worker);
 
             num_removed_blocks += 1;
         }
@@ -342,9 +357,7 @@ impl PositionalIndexer {
         let key = WorkerWithDpRank { worker_id, dp_rank };
         if let Some(worker_map) = worker_blocks.remove(&key) {
             for (seq_hash, (position, local_hash)) in worker_map.iter() {
-                if let Some(mut entry) = self.index.get_mut(&(*position, *local_hash)) {
-                    let _ = entry.remove(*seq_hash, key);
-                }
+                self.remove_index_entry(*position, *local_hash, *seq_hash, key);
             }
             self.tree_sizes.remove(&key);
         }
@@ -368,9 +381,7 @@ impl PositionalIndexer {
         for worker in workers {
             if let Some(worker_map) = worker_blocks.remove(&worker) {
                 for (seq_hash, (position, local_hash)) in worker_map.iter() {
-                    if let Some(mut entry) = self.index.get_mut(&(*position, *local_hash)) {
-                        let _ = entry.remove(*seq_hash, worker);
-                    }
+                    self.remove_index_entry(*position, *local_hash, *seq_hash, worker);
                 }
             }
 
@@ -385,6 +396,30 @@ impl PositionalIndexer {
                 // Fully remove the worker from tree_sizes.
                 self.tree_sizes.remove(&worker);
             }
+        }
+    }
+
+    fn remove_index_entry(
+        &self,
+        position: usize,
+        local_hash: LocalBlockHash,
+        seq_hash: ExternalSequenceBlockHash,
+        worker: WorkerWithDpRank,
+    ) {
+        let mut remove_position_key = false;
+        let mut remove_anchor = false;
+
+        if let Some(mut entry) = self.index.get_mut(&(position, local_hash)) {
+            remove_position_key = entry.remove(seq_hash, worker);
+            remove_anchor = entry.get(seq_hash).is_none();
+        }
+
+        if remove_position_key {
+            self.index.remove(&(position, local_hash));
+        }
+
+        if remove_anchor {
+            self.anchor_lookup.remove(&seq_hash);
         }
     }
 
@@ -489,12 +524,12 @@ impl PositionalIndexer {
         seq_hashes: &mut Vec<ExternalSequenceBlockHash>,
         target_pos: usize,
         sequence: &[LocalBlockHash],
+        initial_seq_hash: ExternalSequenceBlockHash,
     ) {
         while seq_hashes.len() <= target_pos {
             let pos = seq_hashes.len();
             if pos == 0 {
-                // First block's seq_hash equals its local_hash
-                seq_hashes.push(ExternalSequenceBlockHash::from(sequence[0].0));
+                seq_hashes.push(initial_seq_hash);
             } else {
                 let prev_seq_hash = seq_hashes[pos - 1].0;
                 let current_local_hash = sequence[pos].0;
@@ -511,35 +546,39 @@ impl PositionalIndexer {
     /// the query may have diverged from stored sequences at earlier positions.
     fn get_workers_lazy(
         &self,
-        position: usize,
+        absolute_position: usize,
+        query_position: usize,
         local_hash: LocalBlockHash,
         seq_hashes: &mut Vec<ExternalSequenceBlockHash>,
         sequence: &[LocalBlockHash],
+        initial_seq_hash: ExternalSequenceBlockHash,
     ) -> Option<FxHashSet<WorkerWithDpRank>> {
-        let entry = self.index.get(&(position, local_hash))?;
+        let entry = self.index.get(&(absolute_position, local_hash))?;
 
         // Always compute and verify seq_hash to handle divergent queries correctly.
         // Even if there's only one seq_hash entry, the query's seq_hash might differ
         // if the query diverged from the stored sequence at an earlier position.
-        Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
-        let seq_hash = seq_hashes[position];
+        Self::ensure_seq_hash_computed(seq_hashes, query_position, sequence, initial_seq_hash);
+        let seq_hash = seq_hashes[query_position];
         entry.get(seq_hash).cloned()
     }
 
     fn count_workers_at(
         &self,
-        position: usize,
+        absolute_position: usize,
+        query_position: usize,
         local_hash: LocalBlockHash,
         seq_hashes: &mut Vec<ExternalSequenceBlockHash>,
         sequence: &[LocalBlockHash],
+        initial_seq_hash: ExternalSequenceBlockHash,
     ) -> Option<usize> {
-        let entry = self.index.get(&(position, local_hash))?;
+        let entry = self.index.get(&(absolute_position, local_hash))?;
 
         // Always compute and verify seq_hash to handle divergent queries correctly.
         // Even if there's only one seq_hash entry, the query's seq_hash might differ
         // if the query diverged from the stored sequence at an earlier position.
-        Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
-        let seq_hash = seq_hashes[position];
+        Self::ensure_seq_hash_computed(seq_hashes, query_position, sequence, initial_seq_hash);
+        let seq_hash = seq_hashes[query_position];
         Some(
             entry
                 .get(seq_hash)
@@ -553,6 +592,8 @@ impl PositionalIndexer {
     fn linear_scan_drain(
         &self,
         sequence: &[LocalBlockHash],
+        base_position: usize,
+        initial_seq_hash: ExternalSequenceBlockHash,
         seq_hashes: &mut Vec<ExternalSequenceBlockHash>,
         active: &mut FxHashSet<WorkerWithDpRank>,
         scores: &mut OverlapScores,
@@ -568,18 +609,19 @@ impl PositionalIndexer {
                 break;
             }
 
-            let Some(entry) = self.index.get(&(pos, sequence[pos])) else {
+            let absolute_position = base_position + pos;
+            let Some(entry) = self.index.get(&(absolute_position, sequence[pos])) else {
                 Self::drain_active(active, scores, pos);
                 break;
             };
 
-            Self::ensure_seq_hash_computed(seq_hashes, pos, sequence);
+            Self::ensure_seq_hash_computed(seq_hashes, pos, sequence, initial_seq_hash);
             let Some(workers) = entry.get(seq_hashes[pos]) else {
                 Self::drain_active(active, scores, pos);
                 break;
             };
 
-            if workers.len() < active.len() {
+            if workers.len() != active.len() {
                 active.retain(|w| {
                     if workers.contains(w) {
                         true
@@ -621,6 +663,52 @@ impl PositionalIndexer {
         local_hashes: &[LocalBlockHash],
         early_exit: bool,
     ) -> OverlapScores {
+        let Some(first_hash) = local_hashes.first() else {
+            return OverlapScores::new();
+        };
+
+        self.jump_search_matches_from(
+            local_hashes,
+            early_exit,
+            0,
+            ExternalSequenceBlockHash::from(first_hash.0),
+        )
+    }
+
+    fn jump_search_matches_anchored(
+        &self,
+        local_hashes: &[LocalBlockHash],
+        early_exit: bool,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> OverlapScores {
+        let Some(first_hash) = local_hashes.first() else {
+            return OverlapScores::new();
+        };
+
+        let Some(anchor) = start_anchor else {
+            return self.jump_search_matches(local_hashes, early_exit);
+        };
+
+        let Some((base_position, local_hash)) =
+            self.anchor_lookup.get(&anchor).map(|entry| *entry.value())
+        else {
+            return OverlapScores::new();
+        };
+
+        if local_hash != *first_hash {
+            return OverlapScores::new();
+        }
+
+        self.jump_search_matches_from(local_hashes, early_exit, base_position, anchor)
+    }
+
+    fn jump_search_matches_from(
+        &self,
+        local_hashes: &[LocalBlockHash],
+        early_exit: bool,
+        base_position: usize,
+        initial_seq_hash: ExternalSequenceBlockHash,
+    ) -> OverlapScores {
         let mut scores = OverlapScores::new();
 
         if local_hashes.is_empty() {
@@ -631,9 +719,14 @@ impl PositionalIndexer {
         let mut seq_hashes: Vec<ExternalSequenceBlockHash> = Vec::with_capacity(local_hashes.len());
 
         // Check first position to initialize active set
-        let Some(initial_workers) =
-            self.get_workers_lazy(0, local_hashes[0], &mut seq_hashes, local_hashes)
-        else {
+        let Some(initial_workers) = self.get_workers_lazy(
+            base_position,
+            0,
+            local_hashes[0],
+            &mut seq_hashes,
+            local_hashes,
+            initial_seq_hash,
+        ) else {
             return scores;
         };
 
@@ -665,14 +758,17 @@ impl PositionalIndexer {
         // Jump through positions
         while current_pos < len - 1 && !active.is_empty() {
             let next_pos = (current_pos + self.jump_size).min(len - 1);
+            let absolute_position = base_position + next_pos;
 
             // Check workers at jump destination
             let num_workers_at_next = self
                 .count_workers_at(
+                    absolute_position,
                     next_pos,
                     local_hashes[next_pos],
                     &mut seq_hashes,
                     local_hashes,
+                    initial_seq_hash,
                 )
                 .unwrap_or(0);
 
@@ -683,6 +779,8 @@ impl PositionalIndexer {
                 // Scan the range to find where each worker drained
                 self.linear_scan_drain(
                     local_hashes,
+                    base_position,
+                    initial_seq_hash,
                     &mut seq_hashes,
                     &mut active,
                     &mut scores,

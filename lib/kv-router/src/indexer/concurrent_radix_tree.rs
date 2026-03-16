@@ -99,6 +99,8 @@ pub struct ConcurrentRadixTree {
     /// This will only contain root blocks.
     root: SharedBlock,
 
+    anchor_lookup: DashMap<ExternalSequenceBlockHash, (LocalBlockHash, SharedBlock), FxBuildHasher>,
+
     tree_sizes: DashMap<WorkerWithDpRank, AtomicUsize, FxBuildHasher>,
 }
 
@@ -120,6 +122,9 @@ impl Drop for ConcurrentRadixTree {
             stack.extend(root.children.drain().map(|(_, v)| v));
         }
 
+        let anchor_lookup = std::mem::take(&mut self.anchor_lookup);
+        stack.extend(anchor_lookup.into_iter().map(|(_, (_, block))| block));
+
         // Iteratively drop blocks to avoid stack overflow on deep trees.
         // Without this loop, dropping `stack` would recursively drop each
         // Arc<RwLock<Block>> through its `children` map.
@@ -137,6 +142,7 @@ impl ConcurrentRadixTree {
     pub fn new() -> Self {
         Self {
             root: Arc::new(RwLock::new(Block::new())),
+            anchor_lookup: DashMap::with_hasher(FxBuildHasher),
             tree_sizes: DashMap::with_hasher(FxBuildHasher),
         }
     }
@@ -160,21 +166,53 @@ impl ConcurrentRadixTree {
         sequence: &[LocalBlockHash],
         early_exit: bool,
     ) -> OverlapScores {
+        self.find_matches_anchored_impl(sequence, early_exit, None)
+    }
+
+    pub fn find_matches_anchored_impl(
+        &self,
+        sequence: &[LocalBlockHash],
+        early_exit: bool,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> OverlapScores {
+        let Some(first_child) = self.resolve_start_block(sequence, start_anchor) else {
+            return OverlapScores::new();
+        };
+
+        self.find_matches_from_block(sequence, early_exit, first_child)
+    }
+
+    fn resolve_start_block(
+        &self,
+        sequence: &[LocalBlockHash],
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Option<SharedBlock> {
+        let first = *sequence.first()?;
+
+        match start_anchor {
+            Some(anchor) => {
+                let entry = self.anchor_lookup.get(&anchor)?;
+                let (local_hash, block) = entry.value().clone();
+                (local_hash == first).then_some(block)
+            }
+            None => {
+                let guard = self.root.read();
+                guard.children.get(&first).cloned()
+            }
+        }
+    }
+
+    fn find_matches_from_block(
+        &self,
+        sequence: &[LocalBlockHash],
+        early_exit: bool,
+        first_child: SharedBlock,
+    ) -> OverlapScores {
         let mut scores = OverlapScores::new();
 
         if sequence.is_empty() {
             return scores;
         }
-
-        // Get first child from root.
-        let first_child = {
-            let guard = self.root.read();
-            guard.children.get(&sequence[0]).cloned()
-        };
-
-        let Some(first_child) = first_child else {
-            return scores;
-        };
 
         // Initialize active worker set from first child.
         let (mut active, mut active_count) = {
@@ -396,6 +434,10 @@ impl ConcurrentRadixTree {
 
             // Update lookup
             worker_lookup.insert(block_data.block_hash, child.clone());
+            self.anchor_lookup.insert(
+                block_data.block_hash,
+                (block_data.tokens_hash, child.clone()),
+            );
 
             current = child;
         }
@@ -452,10 +494,17 @@ impl ConcurrentRadixTree {
             };
 
             // Remove the worker from this block's worker set.
-            let mut guard = block.write();
-            guard.workers.remove(&worker);
-            if guard.workers.is_empty() {
-                guard.children.clear();
+            let should_remove_anchor = {
+                let mut guard = block.write();
+                guard.workers.remove(&worker);
+                let should_remove_anchor = guard.workers.is_empty();
+                if should_remove_anchor {
+                    guard.children.clear();
+                }
+                should_remove_anchor
+            };
+            if should_remove_anchor {
+                self.anchor_lookup.remove(&block_hash);
             }
 
             num_removed += 1;
@@ -491,11 +540,18 @@ impl ConcurrentRadixTree {
 
         for worker in workers {
             if let Some(worker_lookup) = lookup.remove(&worker) {
-                for (_, block) in worker_lookup.into_iter() {
-                    let mut guard = block.write();
-                    guard.workers.remove(&worker);
-                    if guard.workers.is_empty() {
-                        guard.children.clear();
+                for (block_hash, block) in worker_lookup.into_iter() {
+                    let should_remove_anchor = {
+                        let mut guard = block.write();
+                        guard.workers.remove(&worker);
+                        let should_remove_anchor = guard.workers.is_empty();
+                        if should_remove_anchor {
+                            guard.children.clear();
+                        }
+                        should_remove_anchor
+                    };
+                    if should_remove_anchor {
+                        self.anchor_lookup.remove(&block_hash);
                     }
                 }
 
@@ -523,11 +579,18 @@ impl ConcurrentRadixTree {
     ) {
         let key = WorkerWithDpRank { worker_id, dp_rank };
         if let Some(worker_lookup) = lookup.remove(&key) {
-            for (_, block) in worker_lookup.into_iter() {
-                let mut guard = block.write();
-                guard.workers.remove(&key);
-                if guard.workers.is_empty() {
-                    guard.children.clear();
+            for (block_hash, block) in worker_lookup.into_iter() {
+                let should_remove_anchor = {
+                    let mut guard = block.write();
+                    guard.workers.remove(&key);
+                    let should_remove_anchor = guard.workers.is_empty();
+                    if should_remove_anchor {
+                        guard.children.clear();
+                    }
+                    should_remove_anchor
+                };
+                if should_remove_anchor {
+                    self.anchor_lookup.remove(&block_hash);
                 }
             }
             self.tree_sizes.remove(&key);
@@ -655,6 +718,15 @@ impl SyncIndexer for ConcurrentRadixTree {
 
     fn find_matches(&self, sequence: &[LocalBlockHash], early_exit: bool) -> OverlapScores {
         self.find_matches_impl(sequence, early_exit)
+    }
+
+    fn find_matches_anchored(
+        &self,
+        sequence: &[LocalBlockHash],
+        early_exit: bool,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> OverlapScores {
+        self.find_matches_anchored_impl(sequence, early_exit, start_anchor)
     }
 
     fn dump_events(&self) -> Option<Vec<RouterEvent>> {

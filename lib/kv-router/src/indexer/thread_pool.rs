@@ -133,6 +133,16 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
         Ok(self.backend.find_matches(&sequence, false))
     }
 
+    async fn find_matches_anchored(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Result<OverlapScores, KvRouterError> {
+        Ok(self
+            .backend
+            .find_matches_anchored(&sequence, false, start_anchor))
+    }
+
     async fn find_matches_for_request(
         &self,
         tokens: &[u32],

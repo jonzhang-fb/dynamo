@@ -735,6 +735,108 @@ async fn test_remove_mid_chain_block(variant: &str) {
 
 #[tokio::test]
 #[apply(indexer_template)]
+async fn test_find_matches_anchored_on_detached_suffix(variant: &str) {
+    let index = make_indexer(variant);
+
+    index
+        .apply_event(make_store_event(0, &[1, 2, 3, 4, 5]))
+        .await;
+
+    flush_and_settle(index.as_ref()).await;
+
+    let full_hashes: Vec<LocalBlockHash> = (1..=5).map(LocalBlockHash).collect();
+    let seq_hashes = compute_seq_hash_for_block(&full_hashes);
+    let block_3_seq_hash = ExternalSequenceBlockHash(seq_hashes[2]);
+    let block_4_seq_hash = ExternalSequenceBlockHash(seq_hashes[3]);
+
+    index
+        .apply_event(RouterEvent {
+            worker_id: 0,
+            event: KvCacheEvent {
+                event_id: 0,
+                data: KvCacheEventData::Removed(KvCacheRemoveData {
+                    block_hashes: vec![block_3_seq_hash],
+                }),
+                dp_rank: 0,
+            },
+        })
+        .await;
+
+    flush_and_settle(index.as_ref()).await;
+
+    let detached_suffix = vec![LocalBlockHash(4), LocalBlockHash(5)];
+
+    let scores = index.find_matches(detached_suffix.clone()).await.unwrap();
+    assert!(scores.scores.is_empty());
+
+    let scores = index
+        .find_matches_anchored(detached_suffix.clone(), Some(block_4_seq_hash))
+        .await
+        .unwrap();
+    assert_eq!(*scores.scores.get(&WorkerWithDpRank::new(0, 0)).unwrap(), 2);
+
+    let scores = index
+        .find_matches_anchored(
+            detached_suffix.clone(),
+            Some(ExternalSequenceBlockHash(999_999)),
+        )
+        .await
+        .unwrap();
+    assert!(scores.scores.is_empty());
+
+    let scores = index
+        .find_matches_anchored(vec![LocalBlockHash(5)], Some(block_4_seq_hash))
+        .await
+        .unwrap();
+    assert!(scores.scores.is_empty());
+}
+
+#[tokio::test]
+#[apply(indexer_template)]
+async fn test_find_matches_anchored_disambiguates_repeated_suffix(variant: &str) {
+    let index = make_indexer(variant);
+
+    index
+        .apply_event(make_store_event(0, &[1, 2, 7, 8, 9]))
+        .await;
+    index
+        .apply_event(make_store_event(0, &[3, 4, 7, 8, 10]))
+        .await;
+
+    flush_and_settle(index.as_ref()).await;
+
+    let rootless_query = vec![LocalBlockHash(7), LocalBlockHash(8), LocalBlockHash(9)];
+    let scores = index.find_matches(rootless_query.clone()).await.unwrap();
+    assert!(scores.scores.is_empty());
+
+    let seq_a_input: Vec<LocalBlockHash> = [1_u64, 2, 7, 8, 9]
+        .into_iter()
+        .map(LocalBlockHash)
+        .collect();
+    let seq_b_input: Vec<LocalBlockHash> = [3_u64, 4, 7, 8, 10]
+        .into_iter()
+        .map(LocalBlockHash)
+        .collect();
+    let seq_a = compute_seq_hash_for_block(&seq_a_input);
+    let seq_b = compute_seq_hash_for_block(&seq_b_input);
+    let anchor_a = ExternalSequenceBlockHash(seq_a[2]);
+    let anchor_b = ExternalSequenceBlockHash(seq_b[2]);
+
+    let scores = index
+        .find_matches_anchored(rootless_query.clone(), Some(anchor_a))
+        .await
+        .unwrap();
+    assert_eq!(*scores.scores.get(&WorkerWithDpRank::new(0, 0)).unwrap(), 3);
+
+    let scores = index
+        .find_matches_anchored(rootless_query, Some(anchor_b))
+        .await
+        .unwrap();
+    assert_eq!(*scores.scores.get(&WorkerWithDpRank::new(0, 0)).unwrap(), 2);
+}
+
+#[tokio::test]
+#[apply(indexer_template)]
 async fn test_remove_nonexistent_worker(variant: &str) {
     let index = make_indexer(variant);
 
@@ -1868,6 +1970,7 @@ async fn test_frequency(variant: &str) {
 // KvIndexerMetrics tests
 // ============================================================================
 
+#[cfg(feature = "metrics")]
 #[test]
 fn test_increment_event_applied() {
     let metrics = KvIndexerMetrics::new_unregistered();
@@ -1904,6 +2007,19 @@ fn test_increment_event_applied() {
             .get(),
         1
     );
+}
+
+#[cfg(not(feature = "metrics"))]
+#[test]
+fn test_increment_event_applied() {
+    let metrics = KvIndexerMetrics::new_unregistered();
+
+    metrics.increment_event_applied(METRIC_EVENT_STORED, Ok(()));
+    metrics.increment_event_applied(
+        METRIC_EVENT_STORED,
+        Err(KvCacheEventError::ParentBlockNotFound),
+    );
+    metrics.increment_event_applied(METRIC_EVENT_REMOVED, Err(KvCacheEventError::BlockNotFound));
 }
 
 // ============================================================================

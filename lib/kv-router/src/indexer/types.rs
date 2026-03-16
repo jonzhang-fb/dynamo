@@ -115,6 +115,9 @@ pub struct IndexerQueryRequest {
     pub namespace: String,
     /// Block hashes to find matches for in the radix tree.
     pub block_hashes: Vec<LocalBlockHash>,
+    /// Optional block to anchor the match traversal at.
+    #[serde(default)]
+    pub start_anchor: Option<ExternalSequenceBlockHash>,
 }
 
 /// Wire-friendly overlap scores for JSON serialization.
@@ -192,6 +195,8 @@ pub struct MatchRequest {
     pub sequence: Vec<LocalBlockHash>,
     /// A boolean indicating whether to exit early if a single match is found.
     pub early_exit: bool,
+    /// Optional block to anchor the match traversal at.
+    pub start_anchor: Option<ExternalSequenceBlockHash>,
     /// A channel sender to send the `OverlapScores` response.
     pub resp: oneshot::Sender<OverlapScores>,
     /// Timestamp when the request was created (for queue wait time measurement)
@@ -203,11 +208,13 @@ impl MatchRequest {
     pub(super) fn new(
         sequence: Vec<LocalBlockHash>,
         early_exit: bool,
+        start_anchor: Option<ExternalSequenceBlockHash>,
         resp: oneshot::Sender<OverlapScores>,
     ) -> Self {
         Self {
             sequence,
             early_exit,
+            start_anchor,
             resp,
             #[cfg(feature = "bench")]
             created_at: Instant::now(),
@@ -248,6 +255,7 @@ pub(super) struct RoutingDecisionRequest {
 pub struct ShardedMatchRequest {
     pub(super) sequence: Vec<LocalBlockHash>,
     pub(super) early_exit: bool,
+    pub(super) start_anchor: Option<ExternalSequenceBlockHash>,
     pub(super) resp: mpsc::Sender<OverlapScores>,
     #[cfg(feature = "bench")]
     pub(super) created_at: Instant,
@@ -257,11 +265,13 @@ impl ShardedMatchRequest {
     pub(super) fn new(
         sequence: Vec<LocalBlockHash>,
         early_exit: bool,
+        start_anchor: Option<ExternalSequenceBlockHash>,
         resp: mpsc::Sender<OverlapScores>,
     ) -> Self {
         Self {
             sequence,
             early_exit,
+            start_anchor,
             resp,
             #[cfg(feature = "bench")]
             created_at: Instant::now(),

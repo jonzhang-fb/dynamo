@@ -82,6 +82,10 @@ pub struct RadixTree {
     pub(crate) lookup:
         FxHashMap<WorkerWithDpRank, FxHashMap<ExternalSequenceBlockHash, SharedRadixBlock>>,
 
+    /// Seq-hash anchor lookup for detached subtree matching.
+    pub(crate) anchor_lookup:
+        FxHashMap<ExternalSequenceBlockHash, (LocalBlockHash, SharedRadixBlock)>,
+
     /// The time buffer the radix tree should check when considering frequence of block accesses
     pub(crate) expiration_duration: Option<Duration>,
 }
@@ -106,6 +110,10 @@ impl Drop for RadixTree {
         // Remove all lookup references (they may include blocks not reachable from root)
         for (_, worker_blocks) in self.lookup.drain() {
             stack.extend(worker_blocks.into_values());
+        }
+
+        for (_, (_, block)) in std::mem::take(&mut self.anchor_lookup) {
+            stack.push(block);
         }
 
         // Iteratively free any uniquely-owned blocks without recursion
@@ -135,6 +143,7 @@ impl RadixTree {
         Self {
             root: Rc::new(RefCell::new(RadixBlock::new())),
             lookup: FxHashMap::default(),
+            anchor_lookup: FxHashMap::default(),
             expiration_duration,
         }
     }
@@ -154,6 +163,47 @@ impl RadixTree {
     ///
     /// An `OverlapScores` representing the match scores.
     pub fn find_matches(&self, sequence: Vec<LocalBlockHash>, early_exit: bool) -> OverlapScores {
+        self.find_matches_anchored(sequence, early_exit, None)
+    }
+
+    pub fn find_matches_anchored(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        early_exit: bool,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> OverlapScores {
+        let Some(first_child) = self.resolve_start_block(&sequence, start_anchor) else {
+            return OverlapScores::new();
+        };
+
+        self.find_matches_from_block(&sequence, first_child, early_exit)
+    }
+
+    fn resolve_start_block(
+        &self,
+        sequence: &[LocalBlockHash],
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Option<SharedRadixBlock> {
+        let first = *sequence.first()?;
+
+        match start_anchor {
+            Some(anchor) => {
+                let (local_hash, block) = self.anchor_lookup.get(&anchor)?.clone();
+                (local_hash == first).then_some(block)
+            }
+            None => {
+                let current_borrow = self.root.borrow();
+                current_borrow.children.get(&first).cloned()
+            }
+        }
+    }
+
+    fn find_matches_from_block(
+        &self,
+        sequence: &[LocalBlockHash],
+        first_child: SharedRadixBlock,
+        early_exit: bool,
+    ) -> OverlapScores {
         let mut scores = OverlapScores::new();
 
         if sequence.is_empty() {
@@ -167,23 +217,11 @@ impl RadixTree {
             sequence.iter().map(|h| h.0).collect::<Vec<_>>()
         );
 
-        // Get first child from root.
-        let first_child = {
-            let current_borrow = self.root.borrow();
-            current_borrow.children.get(&sequence[0]).cloned()
-        };
-
-        let Some(first_child) = first_child else {
-            return scores;
-        };
-
-        // Initialize active worker set from first child.
         let (mut active, mut active_count) = {
             let borrow = first_child.borrow();
             (borrow.workers.clone(), borrow.workers.len())
         };
 
-        // Frequency tracking for first child.
         if let Some(expiration_duration) = self.expiration_duration {
             let mut block_mut = first_child.borrow_mut();
             while let Some(access_time) = block_mut.recent_uses.front() {
@@ -205,30 +243,13 @@ impl RadixTree {
             for worker in &active {
                 scores.scores.insert(*worker, 1);
             }
-            for worker in scores.scores.keys() {
-                let tree_size = self
-                    .lookup
-                    .get(worker)
-                    .expect("worker in scores must exist in lookup table")
-                    .len();
-                scores.tree_sizes.insert(*worker, tree_size);
-            }
+            self.populate_tree_sizes(&mut scores);
             return scores;
         }
 
         let mut current = first_child;
         let mut matched_depth = 1u32;
 
-        // Traverse remaining levels. In a clean tree, workers at a child node
-        // are always a subset of the parent (along the same path), so:
-        //   - workers can only drop out, never join, as we descend
-        //   - if child.workers.len() == active_count, the sets are identical
-        //
-        // However, because apply_event(Removed) does NOT cascade to descendants,
-        // a child may transiently have MORE workers than its parent (stale
-        // entries from an ancestor remove whose descendant remove events
-        // haven't arrived yet). We detect this via child_count > active_count
-        // and fall back to a full membership check.
         for (idx, item) in sequence.iter().enumerate().skip(1) {
             let next_block = {
                 let current_borrow = current.borrow();
@@ -244,8 +265,6 @@ impl RadixTree {
                 let child_count = borrow.workers.len();
 
                 if child_count < active_count {
-                    // Workers dropped out. Record scores for those that left.
-                    // Score = matched_depth (number of nodes they were present at).
                     for worker in &active {
                         if !borrow.workers.contains(worker) {
                             scores.scores.insert(*worker, matched_depth);
@@ -254,8 +273,6 @@ impl RadixTree {
                     active.clone_from(&borrow.workers);
                     active_count = child_count;
                 } else if child_count > active_count {
-                    // Stale entries: child retains workers already removed from
-                    // an ancestor. Fall back to full membership check.
                     active.retain(|w| {
                         if borrow.workers.contains(w) {
                             true
@@ -268,7 +285,6 @@ impl RadixTree {
                 }
             }
 
-            // Frequency tracking (always runs when enabled, independent of dropout).
             if let Some(expiration_duration) = self.expiration_duration {
                 let mut block_mut = block.borrow_mut();
                 while let Some(access_time) = block_mut.recent_uses.front() {
@@ -295,14 +311,18 @@ impl RadixTree {
             matched_depth = (idx + 1) as u32;
         }
 
-        // Record scores for workers that survived through the deepest matched level.
         for worker in &active {
             scores.scores.insert(*worker, matched_depth);
         }
 
         tracing::trace!("RadixTree::find_matches: final scores={:?}", scores.scores);
 
-        // Populate tree sizes for all workers that have scores.
+        self.populate_tree_sizes(&mut scores);
+
+        scores
+    }
+
+    fn populate_tree_sizes(&self, scores: &mut OverlapScores) {
         for worker in scores.scores.keys() {
             let tree_size = self
                 .lookup
@@ -311,8 +331,6 @@ impl RadixTree {
                 .len();
             scores.tree_sizes.insert(*worker, tree_size);
         }
-
-        scores
     }
 
     /// Apply a [`RouterEvent`] to the radix tree.
@@ -409,6 +427,10 @@ impl RadixTree {
                     }
 
                     worker_lookup.insert(block_data.block_hash, child.clone());
+                    self.anchor_lookup.insert(
+                        block_data.block_hash,
+                        (block_data.tokens_hash, child.clone()),
+                    );
 
                     drop(parent_mut);
                     current = child;
@@ -445,11 +467,18 @@ impl RadixTree {
                         }
                     };
 
-                    let mut guard = entry.borrow_mut();
-                    guard.workers.remove(&worker);
-                    if guard.workers.is_empty() {
-                        // if no workers are using this block, that is true for all children
-                        guard.children.clear();
+                    let should_remove_anchor = {
+                        let mut guard = entry.borrow_mut();
+                        guard.workers.remove(&worker);
+                        let should_remove_anchor = guard.workers.is_empty();
+                        if should_remove_anchor {
+                            // if no workers are using this block, that is true for all children
+                            guard.children.clear();
+                        }
+                        should_remove_anchor
+                    };
+                    if should_remove_anchor {
+                        self.anchor_lookup.remove(&block);
                     }
                     // remove the block from the worker's lookup table
                     worker_lookup.remove(&block);
@@ -477,11 +506,18 @@ impl RadixTree {
 
         for worker in workers {
             if let Some((worker_key, blocks)) = self.lookup.remove_entry(&worker) {
-                for (_, block) in blocks {
-                    block.borrow_mut().workers.remove(&worker);
-                    // If no workers are using this block, that is true for all children
-                    if block.borrow().workers.is_empty() {
-                        block.borrow_mut().children.clear();
+                for (block_hash, block) in blocks {
+                    let should_remove_anchor = {
+                        let mut guard = block.borrow_mut();
+                        guard.workers.remove(&worker);
+                        let should_remove_anchor = guard.workers.is_empty();
+                        if should_remove_anchor {
+                            guard.children.clear();
+                        }
+                        should_remove_anchor
+                    };
+                    if should_remove_anchor {
+                        self.anchor_lookup.remove(&block_hash);
                     }
                 }
 
@@ -500,10 +536,18 @@ impl RadixTree {
     pub fn remove_worker_dp_rank(&mut self, worker_id: WorkerId, dp_rank: DpRank) {
         let key = WorkerWithDpRank { worker_id, dp_rank };
         if let Some(blocks) = self.lookup.remove(&key) {
-            for (_, block) in blocks {
-                block.borrow_mut().workers.remove(&key);
-                if block.borrow().workers.is_empty() {
-                    block.borrow_mut().children.clear();
+            for (block_hash, block) in blocks {
+                let should_remove_anchor = {
+                    let mut guard = block.borrow_mut();
+                    guard.workers.remove(&key);
+                    let should_remove_anchor = guard.workers.is_empty();
+                    if should_remove_anchor {
+                        guard.children.clear();
+                    }
+                    should_remove_anchor
+                };
+                if should_remove_anchor {
+                    self.anchor_lookup.remove(&block_hash);
                 }
             }
         }

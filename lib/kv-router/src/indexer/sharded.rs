@@ -282,7 +282,11 @@ impl KvIndexerSharded {
 
                                 #[cfg(feature = "bench")]
                                 let process_start = Instant::now();
-                                let matches = trie.find_matches(req.sequence, req.early_exit);
+                                let matches = trie.find_matches_anchored(
+                                    req.sequence,
+                                    req.early_exit,
+                                    req.start_anchor,
+                                );
                                 #[cfg(feature = "bench")]
                                 let process_time = process_start.elapsed();
 
@@ -361,6 +365,14 @@ impl KvIndexerInterface for KvIndexerSharded {
         &self,
         sequence: Vec<LocalBlockHash>,
     ) -> Result<OverlapScores, KvRouterError> {
+        self.find_matches_anchored(sequence, None).await
+    }
+
+    async fn find_matches_anchored(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        start_anchor: Option<ExternalSequenceBlockHash>,
+    ) -> Result<OverlapScores, KvRouterError> {
         #[cfg(feature = "bench")]
         let start = Instant::now();
         #[cfg(feature = "bench")]
@@ -370,7 +382,8 @@ impl KvIndexerInterface for KvIndexerSharded {
 
         'match_loop: loop {
             let (match_tx, mut match_rx) = mpsc::channel(self.event_tx.len());
-            let sharded_req = ShardedMatchRequest::new(sequence.clone(), false, match_tx);
+            let sharded_req =
+                ShardedMatchRequest::new(sequence.clone(), false, start_anchor, match_tx);
             self.request_broadcast_tx
                 .send(sharded_req)
                 .map_err(|_| KvRouterError::IndexerOffline)?;
