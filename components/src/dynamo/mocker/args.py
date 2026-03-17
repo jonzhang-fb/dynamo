@@ -125,6 +125,8 @@ def create_temp_engine_args_file(args: argparse.Namespace) -> Path:
         # - kv_bytes_per_token is auto-computed in main.py after model prefetch,
         # - kv_cache_dtype is only used Python-side for the auto-computation.
         "kv_transfer_bandwidth": getattr(args, "kv_transfer_bandwidth", None),
+        "num_dram_blocks": getattr(args, "num_dram_blocks", None),
+        "g2_transfer_bandwidth": getattr(args, "g2_transfer_bandwidth", None),
     }
 
     # Parse --reasoning JSON string into a nested object
@@ -390,6 +392,23 @@ def parse_args() -> argparse.Namespace:
         "One port per worker (must match --num-workers). "
         "Prefill workers listen on these ports; decode workers connect to them. "
         "If not specified, bootstrap rendezvous is disabled.",
+    )
+
+    parser.add_argument(
+        "--num-dram-blocks-override",
+        type=int,
+        dest="num_dram_blocks",
+        default=None,
+        help="Number of DRAM (G2) blocks for tiered KV cache offloading. "
+        "When > 0, blocks evicted from G1 (VRAM) are offloaded to G2 (DRAM) "
+        "instead of being discarded. (default: 0, disabled)",
+    )
+    parser.add_argument(
+        "--g2-transfer-bandwidth",
+        type=float,
+        default=None,
+        help="G2 <-> G1 transfer bandwidth in GB/s for simulated offload/onboard latency. "
+        "Default: 200.0 (PCIe Gen5 x16). Set to 0 to disable transfer delay.",
     )
 
     # KV cache transfer latency simulation

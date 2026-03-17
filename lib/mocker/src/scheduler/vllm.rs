@@ -301,6 +301,7 @@ impl Scheduler {
                 dp_rank,
                 args.kv_manager_backend,
                 args.eviction_backend,
+                args.num_dram_blocks,
             );
             let mut hit_rates = RunningMean::new(1000);
 

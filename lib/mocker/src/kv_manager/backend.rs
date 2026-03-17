@@ -41,6 +41,25 @@ pub trait KvBackend {
     fn is_block_cached(&self, seq_hash: u64, plh: Option<PositionalLineageHash>) -> bool;
 
     // ------------------------------------------------------------------
+    // G2 (DRAM) tiered cache methods — defaults return no-G2 state
+    // ------------------------------------------------------------------
+
+    /// Number of blocks in the G2 (DRAM) inactive pool.
+    fn num_g2_inactive_blocks(&self) -> usize {
+        0
+    }
+
+    /// Total G2 capacity (0 means G2 is disabled).
+    fn g2_max_capacity(&self) -> usize {
+        0
+    }
+
+    /// Check if a block exists in the G2 cache.
+    fn is_block_in_g2(&self, _seq_hash: u64) -> bool {
+        false
+    }
+
+    // ------------------------------------------------------------------
     // Default methods — shared logic across backends
     // ------------------------------------------------------------------
 

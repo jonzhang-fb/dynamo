@@ -249,6 +249,18 @@ pub struct MockEngineArgs {
     /// Which eviction strategy for KvbmLogical backend
     #[builder(default = "MockerEvictionBackend::Lineage")]
     pub eviction_backend: MockerEvictionBackend,
+
+    /// Number of DRAM (G2) blocks for tiered KV cache offloading.
+    /// When > 0, blocks evicted from G1 (VRAM) are offloaded to G2 (DRAM)
+    /// instead of being discarded. Default: 0 (G2 disabled).
+    #[builder(default = "0")]
+    pub num_dram_blocks: usize,
+
+    /// G2 ↔ G1 transfer bandwidth in GB/s for simulated offload/onboard latency.
+    /// Default: 200.0 (PCIe Gen5 x16). Set to 0 to disable transfer delay.
+    #[builder(default = "200.0")]
+    #[validate(range(min = 0.0))]
+    pub g2_transfer_bandwidth: f64,
 }
 
 impl Default for MockEngineArgs {
@@ -307,6 +319,8 @@ impl MockEngineArgs {
             "zmq_kv_events_port",
             "kv_manager_backend",
             "eviction_backend",
+            "num_dram_blocks",
+            "g2_transfer_bandwidth",
         ]
         .iter()
         .cloned()
@@ -485,6 +499,20 @@ impl MockEngineArgs {
                 }
             };
             builder = builder.kv_manager_backend(backend);
+        }
+
+        // Parse num_dram_blocks
+        if let Some(value) = extra_args.get("num_dram_blocks")
+            && let Some(num) = value.as_u64()
+        {
+            builder = builder.num_dram_blocks(num as usize);
+        }
+
+        // Parse g2_transfer_bandwidth
+        if let Some(value) = extra_args.get("g2_transfer_bandwidth")
+            && let Some(num) = value.as_f64()
+        {
+            builder = builder.g2_transfer_bandwidth(num);
         }
 
         // Parse eviction_backend

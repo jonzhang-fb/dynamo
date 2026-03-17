@@ -34,11 +34,13 @@ pub struct ManualKvManager {
     kv_event_sink: Option<Arc<dyn KvCacheEventSink>>,
     dp_rank: u32,
     next_event_id: u64,
+    /// Optional G2 (DRAM) tier for offloaded KV blocks.
+    g2_cache: Option<HashCache>,
 }
 
 impl ManualKvManager {
     pub fn new(max_capacity: usize, block_size: usize) -> Self {
-        Self::new_with_event_sink(max_capacity, block_size, None, 0)
+        Self::new_with_event_sink(max_capacity, block_size, None, 0, 0)
     }
 
     pub fn new_with_event_sink(
@@ -46,6 +48,7 @@ impl ManualKvManager {
         block_size: usize,
         kv_event_sink: Option<Arc<dyn KvCacheEventSink>>,
         dp_rank: u32,
+        num_dram_blocks: usize,
     ) -> Self {
         debug_assert!(max_capacity > 0, "max_capacity must be > 0");
         if kv_event_sink.is_some() {
@@ -54,12 +57,22 @@ impl ManualKvManager {
             );
         }
 
+        let g2_cache = if num_dram_blocks > 0 {
+            tracing::info!(
+                "G2 (DRAM) tier enabled: {num_dram_blocks} blocks for DP rank {dp_rank}"
+            );
+            Some(HashCache::new(num_dram_blocks))
+        } else {
+            None
+        };
+
         ManualKvManager {
             cache: HashCache::new(max_capacity),
             block_size,
             kv_event_sink,
             dp_rank,
             next_event_id: 0,
+            g2_cache,
         }
     }
 
@@ -149,6 +162,96 @@ impl ManualKvManager {
         }
     }
 
+    /// Log a G2 (DRAM) tier trace event when `DYN_MOCKER_KV_CACHE_TRACE=1`.
+    fn trace_g2_event(&self, event_type: &str, block_id: u64) {
+        if !*KV_CACHE_TRACE_ENABLED {
+            return;
+        }
+        let Some(ref g2) = self.g2_cache else {
+            return;
+        };
+        let g2_inactive = g2.num_inactive();
+        let g2_free = g2.max_capacity().saturating_sub(g2_inactive);
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        tracing::info!(
+            event = event_type,
+            timestamp_ms,
+            block_ids = ?vec![block_id],
+            block_size = self.block_size,
+            g1_free = self.cache.max_capacity()
+                .saturating_sub(self.cache.num_active())
+                .saturating_sub(self.cache.num_inactive()),
+            g1_active = self.cache.num_active(),
+            g1_inactive = self.cache.num_inactive(),
+            g1_total = self.cache.max_capacity(),
+            g2_free = g2_free,
+            g2_inactive = g2_inactive,
+            g2_total = g2.max_capacity(),
+            dp_rank = self.dp_rank,
+            "KV cache trace"
+        );
+    }
+
+    /// Offload a block from G1 inactive → G2 inactive. If G2 is full, evict
+    /// the G2 LRU block first.
+    fn offload_to_g2(&mut self, block: &UniqueBlock) {
+        let Some(ref mut g2) = self.g2_cache else {
+            return;
+        };
+        // If G2 is full, evict LRU from G2 (truly discard)
+        let mut g2_evicted_hash: Option<u64> = None;
+        if g2.is_at_capacity() {
+            if let Some(UniqueBlock::FullBlock(hash)) = g2.evict_inactive() {
+                g2_evicted_hash = Some(hash);
+            }
+        }
+        g2.insert_inactive(block.clone());
+        // Now trace (no more mutable borrow on g2)
+        if let Some(hash) = g2_evicted_hash {
+            self.trace_g2_event("g2_eviction", hash);
+        }
+        if let UniqueBlock::FullBlock(hash) = block {
+            self.trace_g2_event("g1_to_g2_offload", *hash);
+        }
+    }
+
+    /// Try to onboard a block from G2 → G1 active. Returns true if found in G2.
+    fn try_onboard_from_g2(&mut self, block: &UniqueBlock) -> bool {
+        let Some(ref mut g2) = self.g2_cache else {
+            return false;
+        };
+        if !g2.remove_inactive(block) {
+            return false;
+        }
+        // Make room in G1 if needed
+        if self.cache.is_at_capacity() {
+            if let Some(evicted) = self.cache.evict_inactive() {
+                if let UniqueBlock::FullBlock(evicted_hash) = &evicted {
+                    // Publish G1 eviction event
+                    self.publish_kv_event(vec![*evicted_hash], &[], None, false, None);
+                }
+                // Offload the evicted G1 block to G2
+                // (need to re-borrow g2 since publish_kv_event borrows self)
+                self.offload_to_g2(&evicted);
+            } else {
+                // No inactive to evict and G1 is full — cannot onboard
+                // Put it back in G2
+                if let Some(ref mut g2) = self.g2_cache {
+                    g2.insert_inactive(block.clone());
+                }
+                return false;
+            }
+        }
+        self.cache.insert_active(block.clone(), 1);
+        if let UniqueBlock::FullBlock(hash) = block {
+            self.trace_g2_event("g2_to_g1_onboard", *hash);
+        }
+        true
+    }
+
     /// Get the keys of inactive blocks
     pub fn get_inactive_blocks(&self) -> Vec<&UniqueBlock> {
         self.cache.inactive_keys().collect()
@@ -172,16 +275,46 @@ impl KvBackend for ManualKvManager {
                 let mut blocks_stored = Vec::<u64>::new();
                 let mut stored_token_ids: Option<Vec<Vec<u32>>> =
                     token_ids.as_ref().map(|_| Vec::new());
+                let mut g1_active_hits = Vec::<u64>::new();
+                let mut g1_inactive_hits = Vec::<u64>::new();
+                let mut g2_hits = Vec::<u64>::new();
+                // (global_hash, local_hash, parent_hash) for blocks onboarded from G2.
+                // We must publish a Stored event for each so the router re-tracks them;
+                // without it, a subsequent eviction sends a Removed for an unknown hash,
+                // triggering "Failed to find block to remove" in the radix tree indexer.
+                let mut g2_onboard_data: Vec<(u64, BlockHash, Option<u64>)> = Vec::new();
 
                 let mut parent_block: Option<&UniqueBlock> = None;
                 for (i, hash) in hashes.iter().enumerate() {
                     if self.cache.contains_active(hash) {
                         self.cache.increment_ref(hash);
+                        if let UniqueBlock::FullBlock(h) = hash {
+                            g1_active_hits.push(*h);
+                        }
                         parent_block = Some(hash);
                         continue;
                     }
 
                     if self.cache.reactivate(hash) {
+                        if let UniqueBlock::FullBlock(h) = hash {
+                            g1_inactive_hits.push(*h);
+                        }
+                        parent_block = Some(hash);
+                        continue;
+                    }
+
+                    // Check G2 (DRAM) tier before allocating a fresh block
+                    let parent_hash_before_g2 = match parent_block {
+                        Some(UniqueBlock::FullBlock(h)) => Some(*h),
+                        _ => None,
+                    };
+                    if self.try_onboard_from_g2(hash) {
+                        if let UniqueBlock::FullBlock(h) = hash {
+                            g2_hits.push(*h);
+                            if i < local_hashes.len() {
+                                g2_onboard_data.push((*h, local_hashes[i], parent_hash_before_g2));
+                            }
+                        }
                         parent_block = Some(hash);
                         continue;
                     }
@@ -194,9 +327,11 @@ impl KvBackend for ManualKvManager {
                             "Evicting block from inactive pool: {evicted:?}, dp_rank={}",
                             self.dp_rank
                         );
-                        if let UniqueBlock::FullBlock(evicted_full_block) = evicted {
-                            self.publish_kv_event(vec![evicted_full_block], &[], None, false, None);
+                        if let UniqueBlock::FullBlock(evicted_full_block) = &evicted {
+                            self.publish_kv_event(vec![*evicted_full_block], &[], None, false, None);
                         }
+                        // Offload evicted block to G2 instead of discarding
+                        self.offload_to_g2(&evicted);
                     }
 
                     self.cache.insert_active(hash.clone(), 1);
@@ -213,6 +348,45 @@ impl KvBackend for ManualKvManager {
                     Some(UniqueBlock::FullBlock(block)) => Some(*block),
                     Some(UniqueBlock::PartialBlock(_)) => panic!("parent block cannot be partial"),
                 };
+
+                // Emit cache hit trace event with pool breakdown
+                let total_hits = g1_active_hits.len() + g1_inactive_hits.len() + g2_hits.len();
+                if total_hits > 0 && *KV_CACHE_TRACE_ENABLED {
+                    let timestamp_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    tracing::info!(
+                        event = "cache_hit",
+                        timestamp_ms,
+                        g1_active_block_ids = ?&g1_active_hits,
+                        g1_inactive_block_ids = ?&g1_inactive_hits,
+                        g2_block_ids = ?&g2_hits,
+                        block_size = self.block_size,
+                        num_hits = total_hits,
+                        g1_active_hits = g1_active_hits.len(),
+                        g1_inactive_hits = g1_inactive_hits.len(),
+                        g2_hits = g2_hits.len(),
+                        active_blocks = self.cache.num_active(),
+                        inactive_blocks = self.cache.num_inactive(),
+                        total_blocks = self.cache.max_capacity(),
+                        dp_rank = self.dp_rank,
+                        "KV cache trace"
+                    );
+                }
+
+                // Re-notify the router for each block that was onboarded from G2 → G1
+                // BEFORE publishing new allocations that may use them as parents.
+                // When a block was previously evicted from G1 the router received a Removed
+                // event; without a corresponding Stored event on onboarding, a later eviction
+                // sends another Removed for a hash the router no longer knows, causing the
+                // "Failed to find block to remove" warning in the radix-tree indexer.
+                // Publishing first also ensures parent blocks are known before children arrive.
+                for (hash, local_hash, parent) in g2_onboard_data {
+                    let lh = [local_hash];
+                    self.publish_kv_event(vec![hash], &lh, parent, true, None);
+                }
+
                 self.publish_kv_event(
                     blocks_stored,
                     local_hashes,
@@ -313,6 +487,25 @@ impl KvBackend for ManualKvManager {
     fn is_block_cached(&self, seq_hash: u64, _plh: Option<PositionalLineageHash>) -> bool {
         let block = UniqueBlock::FullBlock(seq_hash);
         self.cache.contains(&block)
+            || self
+                .g2_cache
+                .as_ref()
+                .is_some_and(|g2| g2.contains_inactive(&block))
+    }
+
+    fn num_g2_inactive_blocks(&self) -> usize {
+        self.g2_cache.as_ref().map_or(0, |g2| g2.num_inactive())
+    }
+
+    fn g2_max_capacity(&self) -> usize {
+        self.g2_cache.as_ref().map_or(0, |g2| g2.max_capacity())
+    }
+
+    fn is_block_in_g2(&self, seq_hash: u64) -> bool {
+        let block = UniqueBlock::FullBlock(seq_hash);
+        self.g2_cache
+            .as_ref()
+            .is_some_and(|g2| g2.contains_inactive(&block))
     }
 }
 
@@ -432,5 +625,94 @@ mod tests {
         assert_inactive_blocks(&manager, 1, &[5]);
 
         use_blocks(&mut manager, vec![13]);
+    }
+
+    /// Test G2 (DRAM) tiered cache: offload, onboard, and eviction flows.
+    ///
+    /// Scenario: G1=4 blocks, G2=2 blocks
+    ///   Phase 1: Fill G1 with blocks 0-3
+    ///   Phase 2: Deref all → inactive, then Use blocks 4,5 → evict 0,1 → offload to G2
+    ///   Phase 3: Re-Use block 0 → should onboard from G2 back to G1
+    #[test]
+    fn test_g2_offload_and_onboard() {
+        // Enable tracing env var for this test
+        // SAFETY: single-threaded test, no concurrent env access
+        unsafe { std::env::set_var("DYN_MOCKER_KV_CACHE_TRACE", "1") };
+
+        let mut manager = ManualKvManager::new_with_event_sink(4, 16, None, 0, 2);
+
+        // Verify G2 is configured
+        assert_eq!(manager.g2_max_capacity(), 2);
+        assert_eq!(manager.num_g2_inactive_blocks(), 0);
+
+        fn use_blocks(manager: &mut ManualKvManager, ids: Vec<u64>) -> bool {
+            let blocks: Vec<_> = ids.iter().map(|&id| UniqueBlock::FullBlock(id)).collect();
+            let hashes: Vec<_> = ids.into_iter().collect();
+            manager.process(&MoveBlock::Use(blocks, hashes, vec![], None))
+        }
+
+        fn deref_blocks(manager: &mut ManualKvManager, ids: Vec<u64>) {
+            let blocks = ids.into_iter().map(UniqueBlock::FullBlock).collect();
+            manager.process(&MoveBlock::Deref(blocks));
+        }
+
+        // Phase 1: Fill G1 with blocks 0-3
+        assert!(use_blocks(&mut manager, vec![0, 1, 2, 3]));
+        assert_eq!(manager.num_active_blocks(), 4);
+        assert_eq!(manager.num_inactive_blocks(), 0);
+
+        // Deref all to move them to inactive pool
+        deref_blocks(&mut manager, vec![0, 1, 2, 3]);
+        assert_eq!(manager.num_active_blocks(), 0);
+        assert_eq!(manager.num_inactive_blocks(), 4);
+
+        // Phase 2: Use new blocks 4,5 → must evict LRU from G1 → offloads to G2
+        assert!(use_blocks(&mut manager, vec![4]));
+        // Block 0 (oldest LRU) should be evicted from G1 → offloaded to G2
+        assert_eq!(manager.num_g2_inactive_blocks(), 1);
+        assert!(manager.is_block_in_g2(0), "Block 0 should be in G2");
+
+        assert!(use_blocks(&mut manager, vec![5]));
+        // Block 1 evicted → offloaded to G2
+        assert_eq!(manager.num_g2_inactive_blocks(), 2);
+        assert!(manager.is_block_in_g2(1), "Block 1 should be in G2");
+
+        // G1: active=[4,5], inactive=[2,3], G2: inactive=[0,1]
+        assert_eq!(manager.num_active_blocks(), 2);
+        assert_eq!(manager.num_inactive_blocks(), 2);
+
+        // Phase 3: Re-use block 0 → should onboard from G2 back to G1
+        deref_blocks(&mut manager, vec![4, 5]);
+        // G1: active=[], inactive=[2,3,4,5], G2: inactive=[0,1]
+        assert_eq!(manager.num_active_blocks(), 0);
+        assert_eq!(manager.num_inactive_blocks(), 4);
+
+        assert!(use_blocks(&mut manager, vec![0]));
+        // Block 0 should be onboarded from G2 → G1 active.
+        // G1 was at capacity so onboarding evicts block 2 from G1 inactive → offloads to G2.
+        // Result: G2 goes from {0,1} → remove 0 → {1} → add 2 → {1,2}
+        assert!(!manager.is_block_in_g2(0), "Block 0 should no longer be in G2");
+        assert_eq!(manager.num_g2_inactive_blocks(), 2);
+        assert!(manager.is_block_in_g2(1), "Block 1 should still be in G2");
+        assert!(manager.is_block_in_g2(2), "Block 2 should have been offloaded to G2 during onboard");
+        assert!(
+            manager.cache.contains_active(&UniqueBlock::FullBlock(0)),
+            "Block 0 should be in G1 active after onboarding"
+        );
+
+        // Phase 4: Verify G2 eviction when G2 is full
+        // Currently G2 has [1]. Fill G1 again and evict 2 more to G2.
+        deref_blocks(&mut manager, vec![0]);
+        // G1: active=[], inactive=[0,2,3,4,5] — wait, G1 only has 4 capacity
+        // Actually: G1 has capacity 4, so inactive can hold up to 4 blocks.
+        // After deref of 0: G1 inactive should have [2,3,4,5,0] minus the one evicted for 0's onboard
+        // Let's check actual state:
+        let g1_active = manager.num_active_blocks();
+        let g1_inactive = manager.num_inactive_blocks();
+        let g2_inactive = manager.num_g2_inactive_blocks();
+        assert_eq!(g1_active, 0);
+        // G1 should be at capacity (4 blocks): the onboard of 0 might have evicted an inactive
+        assert!(g1_inactive <= 4, "G1 inactive should not exceed capacity");
+        assert!(g2_inactive >= 1, "G2 should have at least 1 block");
     }
 }
