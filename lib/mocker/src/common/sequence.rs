@@ -6,6 +6,7 @@ use derive_getters::Getters;
 use dynamo_tokens::blocks::UniqueBlock;
 use dynamo_tokens::{PositionalLineageHash, TokenBlockSequence, Tokens};
 use rand::random;
+use std::collections::HashMap;
 use validator::Validate;
 
 /// Create unique blocks and positional lineage hashes from a TokenBlockSequence
@@ -61,6 +62,9 @@ pub struct ActiveSequence {
 
     #[getter(copy)]
     emit_token_ids: bool,
+
+    /// Per-block read counts accumulated during decode phase (block_id -> read_count)
+    decode_block_reads: HashMap<u64, usize>,
 }
 
 impl ActiveSequence {
@@ -109,6 +113,7 @@ impl ActiveSequence {
             creation_signal,
             enable_prefix_caching,
             emit_token_ids,
+            decode_block_reads: HashMap::new(),
         };
         seq.validate().expect("invalid ActiveSequence");
         seq
@@ -135,6 +140,17 @@ impl ActiveSequence {
             .blocks()
             .iter()
             .map(|block| block.block_hash())
+            .collect()
+    }
+
+    /// Full block IDs in scheduler order, aligned with KvManager `UniqueBlock::FullBlock` IDs.
+    pub fn full_block_ids(&self) -> Vec<u64> {
+        self.unique_blocks
+            .iter()
+            .filter_map(|block| match block {
+                UniqueBlock::FullBlock(hash) => Some(*hash),
+                UniqueBlock::PartialBlock(_) => None,
+            })
             .collect()
     }
 
@@ -260,6 +276,18 @@ impl ActiveSequence {
         // Free all blocks when we reach max tokens
         signals.extend(self.free_signal());
         signals
+    }
+
+    /// Record reads for a set of blocks during decode phase
+    pub fn record_decode_block_reads(&mut self, block_ids: Vec<u64>) {
+        for block_id in block_ids {
+            *self.decode_block_reads.entry(block_id).or_insert(0) += 1;
+        }
+    }
+
+    /// Get and reset per-block decode reads (for reporting at completion)
+    pub fn take_decode_block_reads(&mut self) -> HashMap<u64, usize> {
+        std::mem::take(&mut self.decode_block_reads)
     }
 
     /// Free all blocks, generating appropriate signals for each block type

@@ -40,6 +40,7 @@ use crate::common::utils::sleep_until_precise;
 use crate::kv_manager::{KvBackend, KvManager};
 use dynamo_kv_router::protocols::DpRank;
 use dynamo_tokens::blocks::UniqueBlock;
+use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,11 +50,29 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use validator::Validate;
 
+const KV_EVENT_SCHEMA: &str = "v1";
+
 /// Simple metrics struct for mocker's internal use
 #[derive(Clone, Default, Debug)]
 pub struct MockerMetrics {
     pub dp_rank: DpRank,
     pub active_decode_blocks: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DecodeBlockReadSummary {
+    block_id: u64,
+    read_count: usize,
+    block_origin: &'static str,
+}
+
+fn sort_block_read_summaries(blocks: &mut [DecodeBlockReadSummary]) {
+    blocks.sort_by(|a, b| {
+        b.read_count
+            .cmp(&a.read_count)
+            .then_with(|| a.block_origin.cmp(b.block_origin))
+            .then_with(|| a.block_id.cmp(&b.block_id))
+    });
 }
 
 /// Enum representing either a direct request or an active sequence
@@ -123,11 +142,16 @@ impl SchedulerState {
 
     /// Try (chunked) prefill and move to decode queue
     ///
-    /// Returns `Some((prefill_compute, creation_signal, is_full_prefill))` where:
+    /// Returns `Some((uuid, prefill_cost, prefill_compute, creation_signal, is_full_prefill))` where:
+    /// - `uuid`: The request UUID being prefetched
+    /// - `prefill_cost`: Prefill cache cost summary for this request
     /// - `prefill_compute`: The compute time in milliseconds for this prefill operation
     /// - `creation_signal`: Optional MoveBlock signal for KV cache block creation
     /// - `is_full_prefill`: true if the entire sequence was prefilled, false if chunked
-    fn try_prefill(&mut self, perf_model: &PerfModel) -> Option<(f64, Option<MoveBlock>, bool)> {
+    fn try_prefill(
+        &mut self,
+        perf_model: &PerfModel,
+    ) -> Option<(Uuid, PrefillCost, f64, Option<MoveBlock>, bool)> {
         let uuid = self.prefill.pop_front()?;
 
         // Remove and extract prefill_compute from prefill_costs
@@ -135,6 +159,7 @@ impl SchedulerState {
             .prefill_costs
             .remove(&uuid)
             .expect("Expects valid prefill cost.");
+        let prefill_cost_for_trace = prefill_cost.clone();
 
         let new_tokens = prefill_cost.new_tokens;
 
@@ -181,6 +206,8 @@ impl SchedulerState {
         };
 
         Some((
+            uuid,
+            prefill_cost_for_trace,
             prefill_compute,
             sequence.take_creation_signal(),
             is_full_prefill,
@@ -415,7 +442,7 @@ async fn simulate_prefill(
     let start_time = Instant::now();
     let mut total_time = Duration::ZERO;
 
-    while let Some((prefill_compute, maybe_creation_signal, is_full_prefill)) =
+    while let Some((uuid, prefill_cost, prefill_compute, maybe_creation_signal, is_full_prefill)) =
         state.try_prefill(perf_model)
     {
         // NOTE: Prefill cost/time is always incremented for new blocks, even if they
@@ -429,6 +456,55 @@ async fn simulate_prefill(
             && !process_signals(kv_manager, std::slice::from_ref(&creation_signal))
         {
             panic!("Block allocation for prefilling cannot fail.");
+        }
+
+        // Emit a single KV event per completed prefill with ordered per-block read totals.
+        // Cached prompt blocks contribute one read during prefix lookup; newly allocated blocks
+        // are represented with zero reads for easier downstream analysis.
+        if is_full_prefill {
+            let Some(Request::Active(sequence)) = state.requests.get(&uuid) else {
+                panic!("Request does not exist.");
+            };
+            let block_hashes = sequence.full_block_ids();
+            let total_full_blocks = block_hashes.len();
+            let cached_blocks = total_full_blocks.saturating_sub(prefill_cost.new_blocks);
+
+            let per_block_reads: Vec<DecodeBlockReadSummary> = block_hashes
+                .into_iter()
+                .enumerate()
+                .map(|(index, block_id)| DecodeBlockReadSummary {
+                    block_id,
+                    read_count: if index < cached_blocks { 1 } else { 0 },
+                    block_origin: if index < cached_blocks {
+                        "cached_prompt"
+                    } else {
+                        "new_prompt"
+                    },
+                })
+                .collect();
+            let mut per_block_reads = per_block_reads;
+            sort_block_read_summaries(&mut per_block_reads);
+            let total_prefill_reads: usize = per_block_reads.iter().map(|b| b.read_count).sum();
+            let per_block_reads_json =
+                serde_json::to_string(&per_block_reads).unwrap_or_else(|_| "[]".to_string());
+
+            tracing::info!(
+                event = "kv_event",
+                kv_event_schema = KV_EVENT_SCHEMA,
+                kv_event_component = "scheduler",
+                kv_event_phase = "prefill",
+                kv_event_name = "block_reads_summary",
+                kv_event_reason = "prefill_block_reads",
+                kv_event_type = "prefill_block_reads",
+                uuid = ?uuid,
+                block_size = sequence.block_size(),
+                total_full_blocks,
+                cached_blocks,
+                new_blocks = prefill_cost.new_blocks,
+                total_prefill_reads,
+                per_block_reads = %per_block_reads_json,
+                "KV prefill block read summary"
+            );
         }
 
         // Impossible to schedule more prefills if we encounter one incomplete (chunked) prefill
@@ -488,6 +564,7 @@ async fn simulate_decode(
         let Some(sequence) = state.run(uuid) else {
             continue;
         };
+
         let signals = sequence.generate();
 
         // Process all signals with the KvManager
@@ -498,6 +575,14 @@ async fn simulate_decode(
                 kv_manager.process(&signal);
             }
             continue;
+        }
+
+        // Record reads for every full block visible to attention after this decode step.
+        // Once decode grows beyond the prompt-only prefix, decode-generated full blocks
+        // accumulate fewer reads than older prompt blocks, which makes the trace informative.
+        let full_block_hashes = sequence.full_block_ids();
+        if !full_block_hashes.is_empty() {
+            sequence.record_decode_block_reads(full_block_hashes);
         }
 
         // Check completion and send notification
@@ -515,6 +600,48 @@ async fn simulate_decode(
             for signal in &sequence.free_signal() {
                 kv_manager.process(signal);
             }
+        }
+
+        // Emit a single KV event with ordered per-block decode read totals.
+        if is_complete || send_failed {
+            let prompt_full_blocks = sequence.num_input_tokens() / block_size;
+            let ordered_block_hashes = sequence.full_block_ids();
+            let decode_block_reads = sequence.take_decode_block_reads();
+            let total_decode_reads: usize = decode_block_reads.values().sum();
+            let per_block_reads: Vec<DecodeBlockReadSummary> = ordered_block_hashes
+                .into_iter()
+                .enumerate()
+                .map(|(index, block_id)| DecodeBlockReadSummary {
+                    block_id,
+                    read_count: decode_block_reads.get(&block_id).copied().unwrap_or_default(),
+                    block_origin: if index < prompt_full_blocks {
+                        "prompt"
+                    } else {
+                        "decode"
+                    },
+                })
+                .collect();
+            let mut per_block_reads = per_block_reads;
+            sort_block_read_summaries(&mut per_block_reads);
+            let per_block_reads_json =
+                serde_json::to_string(&per_block_reads).unwrap_or_else(|_| "[]".to_string());
+
+            tracing::info!(
+                event = "kv_event",
+                kv_event_schema = KV_EVENT_SCHEMA,
+                kv_event_component = "scheduler",
+                kv_event_phase = "decode",
+                kv_event_name = "block_reads_summary",
+                kv_event_reason = "decode_block_reads",
+                kv_event_type = "decode_block_reads",
+                uuid = ?uuid,
+                block_size,
+                prompt_full_blocks,
+                decode_full_blocks = per_block_reads.len().saturating_sub(prompt_full_blocks),
+                total_decode_reads = total_decode_reads,
+                per_block_reads = %per_block_reads_json,
+                "KV decode block read summary"
+            );
         }
 
         if send_failed || is_complete {

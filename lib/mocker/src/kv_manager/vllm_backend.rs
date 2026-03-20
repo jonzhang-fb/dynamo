@@ -28,6 +28,8 @@ static KV_CACHE_TRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or(false)
 });
 
+    const KV_EVENT_SCHEMA: &str = "v1";
+
 pub struct ManualKvManager {
     cache: HashCache,
     block_size: usize,
@@ -84,32 +86,58 @@ impl ManualKvManager {
         parent_hash: Option<u64>,
         is_store: bool,
         token_ids: Option<Vec<Vec<u32>>>,
+        trace_reason: Option<&'static str>,
     ) {
         if full_blocks.is_empty() {
             return;
         }
 
         if *KV_CACHE_TRACE_ENABLED {
+            let partial_active_blocks = self
+                .cache
+                .active_keys()
+                .filter(|b| matches!(b, UniqueBlock::PartialBlock(_)))
+                .count();
+            let partial_inactive_blocks = self
+                .cache
+                .inactive_keys()
+                .filter(|b| matches!(b, UniqueBlock::PartialBlock(_)))
+                .count();
             let active_len = self.cache.num_active();
             let inactive_len = self.cache.num_inactive();
+            let full_active_blocks = active_len.saturating_sub(partial_active_blocks);
+            let full_inactive_blocks = inactive_len.saturating_sub(partial_inactive_blocks);
             let free_blocks = self
                 .cache
                 .max_capacity()
                 .saturating_sub(active_len)
                 .saturating_sub(inactive_len);
-            let event = if is_store { "allocation" } else { "eviction" };
+            let kv_event_name = if is_store {
+                "cache_allocation"
+            } else {
+                "cache_eviction"
+            };
             let timestamp_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
             tracing::info!(
-                event,
+                event = "kv_event",
+                kv_event_schema = KV_EVENT_SCHEMA,
+                kv_event_component = "kv_manager",
+                kv_event_phase = "cache_mutation",
+                kv_event_name,
+                kv_event_reason = trace_reason.unwrap_or("unspecified"),
                 timestamp_ms,
                 block_ids = ?&full_blocks,
                 block_size = self.block_size,
                 free_blocks_after = free_blocks,
                 active_blocks = active_len,
                 inactive_blocks = inactive_len,
+                full_active_blocks,
+                full_inactive_blocks,
+                partial_active_blocks,
+                partial_inactive_blocks,
                 total_blocks = self.cache.max_capacity(),
                 dp_rank = self.dp_rank,
                 "KV cache trace"
@@ -163,7 +191,14 @@ impl ManualKvManager {
     }
 
     /// Log a G2 (DRAM) tier trace event when `DYN_MOCKER_KV_CACHE_TRACE=1`.
-    fn trace_g2_event(&self, event_type: &str, block_id: u64) {
+    fn trace_g2_event(
+        &self,
+        kv_event_name: &'static str,
+        kv_event_reason: &'static str,
+        source_tier: &'static str,
+        target_tier: &'static str,
+        block_id: u64,
+    ) {
         if !*KV_CACHE_TRACE_ENABLED {
             return;
         }
@@ -177,7 +212,14 @@ impl ManualKvManager {
             .unwrap_or_default()
             .as_millis() as u64;
         tracing::info!(
-            event = event_type,
+            event = "kv_event",
+            kv_event_schema = KV_EVENT_SCHEMA,
+            kv_event_component = "kv_manager",
+            kv_event_phase = "tier_transition",
+            kv_event_name,
+            kv_event_reason,
+            source_tier,
+            target_tier,
             timestamp_ms,
             block_ids = ?vec![block_id],
             block_size = self.block_size,
@@ -211,10 +253,22 @@ impl ManualKvManager {
         g2.insert_inactive(block.clone());
         // Now trace (no more mutable borrow on g2)
         if let Some(hash) = g2_evicted_hash {
-            self.trace_g2_event("g2_eviction", hash);
+            self.trace_g2_event(
+                "tier_eviction",
+                "g2_eviction",
+                "g2",
+                "none",
+                hash,
+            );
         }
         if let UniqueBlock::FullBlock(hash) = block {
-            self.trace_g2_event("g1_to_g2_offload", *hash);
+            self.trace_g2_event(
+                "tier_move",
+                "g1_to_g2_offload",
+                "g1",
+                "g2",
+                *hash,
+            );
         }
     }
 
@@ -231,7 +285,14 @@ impl ManualKvManager {
             if let Some(evicted) = self.cache.evict_inactive() {
                 if let UniqueBlock::FullBlock(evicted_hash) = &evicted {
                     // Publish G1 eviction event
-                    self.publish_kv_event(vec![*evicted_hash], &[], None, false, None);
+                    self.publish_kv_event(
+                        vec![*evicted_hash],
+                        &[],
+                        None,
+                        false,
+                        None,
+                        Some("g2_eviction"),
+                    );
                 }
                 // Offload the evicted G1 block to G2
                 // (need to re-borrow g2 since publish_kv_event borrows self)
@@ -247,7 +308,13 @@ impl ManualKvManager {
         }
         self.cache.insert_active(block.clone(), 1);
         if let UniqueBlock::FullBlock(hash) = block {
-            self.trace_g2_event("g2_to_g1_onboard", *hash);
+            self.trace_g2_event(
+                "tier_move",
+                "g2_to_g1_onboard",
+                "g2",
+                "g1",
+                *hash,
+            );
         }
         true
     }
@@ -328,7 +395,14 @@ impl KvBackend for ManualKvManager {
                             self.dp_rank
                         );
                         if let UniqueBlock::FullBlock(evicted_full_block) = &evicted {
-                            self.publish_kv_event(vec![*evicted_full_block], &[], None, false, None);
+                            self.publish_kv_event(
+                                vec![*evicted_full_block],
+                                &[],
+                                None,
+                                false,
+                                None,
+                                Some("g1_to_g2_offload"),
+                            );
                         }
                         // Offload evicted block to G2 instead of discarding
                         self.offload_to_g2(&evicted);
@@ -349,31 +423,10 @@ impl KvBackend for ManualKvManager {
                     Some(UniqueBlock::PartialBlock(_)) => panic!("parent block cannot be partial"),
                 };
 
-                // Emit cache hit trace event with pool breakdown
-                let total_hits = g1_active_hits.len() + g1_inactive_hits.len() + g2_hits.len();
-                if total_hits > 0 && *KV_CACHE_TRACE_ENABLED {
-                    let timestamp_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    tracing::info!(
-                        event = "cache_hit",
-                        timestamp_ms,
-                        g1_active_block_ids = ?&g1_active_hits,
-                        g1_inactive_block_ids = ?&g1_inactive_hits,
-                        g2_block_ids = ?&g2_hits,
-                        block_size = self.block_size,
-                        num_hits = total_hits,
-                        g1_active_hits = g1_active_hits.len(),
-                        g1_inactive_hits = g1_inactive_hits.len(),
-                        g2_hits = g2_hits.len(),
-                        active_blocks = self.cache.num_active(),
-                        inactive_blocks = self.cache.num_inactive(),
-                        total_blocks = self.cache.max_capacity(),
-                        dp_rank = self.dp_rank,
-                        "KV cache trace"
-                    );
-                }
+                // Per-step cache_hit trace disabled - per-block aggregated reads are emitted
+                // at request completion instead to avoid trace flooding during decode.
+                // The per-block read counts accumulated during the decode phase provide
+                // accurate accounting of how many times each prefilled block was accessed.
 
                 // Re-notify the router for each block that was onboarded from G2 → G1
                 // BEFORE publishing new allocations that may use them as parents.
@@ -384,7 +437,14 @@ impl KvBackend for ManualKvManager {
                 // Publishing first also ensures parent blocks are known before children arrive.
                 for (hash, local_hash, parent) in g2_onboard_data {
                     let lh = [local_hash];
-                    self.publish_kv_event(vec![hash], &lh, parent, true, None);
+                    self.publish_kv_event(
+                        vec![hash],
+                        &lh,
+                        parent,
+                        true,
+                        None,
+                        Some("g2_onboard_restore"),
+                    );
                 }
 
                 self.publish_kv_event(
@@ -393,6 +453,7 @@ impl KvBackend for ManualKvManager {
                     parent_hash,
                     true,
                     stored_token_ids,
+                    Some("use_full_blocks"),
                 );
             }
 
@@ -404,7 +465,14 @@ impl KvBackend for ManualKvManager {
                         blocks_destroyed.push(*destroyed_full_block);
                     }
                 }
-                self.publish_kv_event(blocks_destroyed, &[], None, false, None);
+                self.publish_kv_event(
+                    blocks_destroyed,
+                    &[],
+                    None,
+                    false,
+                    None,
+                    Some("destroy_full_blocks"),
+                );
             }
 
             MoveBlock::Deref(hashes) => {
@@ -449,6 +517,7 @@ impl KvBackend for ManualKvManager {
                         *parent_hash,
                         true,
                         promote_token_ids.as_ref().map(|t| vec![t.clone()]),
+                        Some("promote_partial_to_full"),
                     );
                 }
             }
