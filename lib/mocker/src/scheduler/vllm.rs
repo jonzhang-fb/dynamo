@@ -329,6 +329,7 @@ impl Scheduler {
                 args.kv_manager_backend,
                 args.eviction_backend,
                 args.num_dram_blocks,
+                args.num_ssd_blocks,
             );
             let mut hit_rates = RunningMean::new(1000);
 

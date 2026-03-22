@@ -65,6 +65,7 @@ impl KvManager {
             KvManagerBackend::Manual,
             MockerEvictionBackend::default(),
             0,
+            0,
         )
     }
 
@@ -76,6 +77,7 @@ impl KvManager {
         backend: KvManagerBackend,
         eviction_backend: MockerEvictionBackend,
         num_dram_blocks: usize,
+        num_ssd_blocks: usize,
     ) -> Self {
         match backend {
             KvManagerBackend::Manual => Self::Manual(ManualKvManager::new_with_event_sink(
@@ -84,6 +86,7 @@ impl KvManager {
                 kv_event_sink,
                 dp_rank,
                 num_dram_blocks,
+                num_ssd_blocks,
             )),
             KvManagerBackend::KvbmLogical => Self::KvbmLogical(KvbmLogicalKvManager::new(
                 max_capacity,
@@ -170,6 +173,27 @@ impl KvBackend for KvManager {
     fn is_block_in_g2(&self, seq_hash: u64) -> bool {
         match self {
             Self::Manual(m) => m.is_block_in_g2(seq_hash),
+            Self::KvbmLogical(_) => false,
+        }
+    }
+
+    fn num_g3_inactive_blocks(&self) -> usize {
+        match self {
+            Self::Manual(m) => m.num_g3_inactive_blocks(),
+            Self::KvbmLogical(_) => 0,
+        }
+    }
+
+    fn g3_max_capacity(&self) -> usize {
+        match self {
+            Self::Manual(m) => m.g3_max_capacity(),
+            Self::KvbmLogical(_) => 0,
+        }
+    }
+
+    fn is_block_in_g3(&self, seq_hash: u64) -> bool {
+        match self {
+            Self::Manual(m) => m.is_block_in_g3(seq_hash),
             Self::KvbmLogical(_) => false,
         }
     }

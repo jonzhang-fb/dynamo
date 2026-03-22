@@ -60,6 +60,25 @@ pub trait KvBackend {
     }
 
     // ------------------------------------------------------------------
+    // G3 (SSD) tiered cache methods — defaults return no-G3 state
+    // ------------------------------------------------------------------
+
+    /// Number of blocks in the G3 (SSD) inactive pool.
+    fn num_g3_inactive_blocks(&self) -> usize {
+        0
+    }
+
+    /// Total G3 capacity (0 means G3 is disabled).
+    fn g3_max_capacity(&self) -> usize {
+        0
+    }
+
+    /// Check if a block exists in the G3 cache.
+    fn is_block_in_g3(&self, _seq_hash: u64) -> bool {
+        false
+    }
+
+    // ------------------------------------------------------------------
     // Default methods — shared logic across backends
     // ------------------------------------------------------------------
 

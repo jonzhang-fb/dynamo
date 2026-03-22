@@ -127,6 +127,8 @@ def create_temp_engine_args_file(args: argparse.Namespace) -> Path:
         "kv_transfer_bandwidth": getattr(args, "kv_transfer_bandwidth", None),
         "num_dram_blocks": getattr(args, "num_dram_blocks", None),
         "g2_transfer_bandwidth": getattr(args, "g2_transfer_bandwidth", None),
+        "num_ssd_blocks": getattr(args, "num_ssd_blocks", None),
+        "g3_transfer_bandwidth": getattr(args, "g3_transfer_bandwidth", None),
     }
 
     # Parse --reasoning JSON string into a nested object
@@ -409,6 +411,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="G2 <-> G1 transfer bandwidth in GB/s for simulated offload/onboard latency. "
         "Default: 200.0 (PCIe Gen5 x16). Set to 0 to disable transfer delay.",
+    )
+    parser.add_argument(
+        "--num-ssd-blocks-override",
+        type=int,
+        dest="num_ssd_blocks",
+        default=None,
+        help="Number of SSD (G3) blocks for tiered KV cache offloading. "
+        "When > 0, blocks evicted from G2 are offloaded to G3 instead of being discarded. "
+        "(default: 0, disabled)",
+    )
+    parser.add_argument(
+        "--g3-transfer-bandwidth",
+        type=float,
+        default=None,
+        help="G3 <-> G1 transfer bandwidth in GB/s for simulated SSD onboard latency. "
+        "Default: 7.0 (NVMe Gen4-class throughput). Set to 0 to disable transfer delay.",
     )
 
     # KV cache transfer latency simulation

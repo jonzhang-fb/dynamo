@@ -28,7 +28,7 @@ static KV_CACHE_TRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or(false)
 });
 
-    const KV_EVENT_SCHEMA: &str = "v1";
+const KV_EVENT_SCHEMA: &str = "v1";
 
 pub struct ManualKvManager {
     cache: HashCache,
@@ -38,11 +38,13 @@ pub struct ManualKvManager {
     next_event_id: u64,
     /// Optional G2 (DRAM) tier for offloaded KV blocks.
     g2_cache: Option<HashCache>,
+    /// Optional G3 (SSD) tier for offloaded KV blocks.
+    g3_cache: Option<HashCache>,
 }
 
 impl ManualKvManager {
     pub fn new(max_capacity: usize, block_size: usize) -> Self {
-        Self::new_with_event_sink(max_capacity, block_size, None, 0, 0)
+        Self::new_with_event_sink(max_capacity, block_size, None, 0, 0, 0)
     }
 
     pub fn new_with_event_sink(
@@ -51,6 +53,7 @@ impl ManualKvManager {
         kv_event_sink: Option<Arc<dyn KvCacheEventSink>>,
         dp_rank: u32,
         num_dram_blocks: usize,
+        num_ssd_blocks: usize,
     ) -> Self {
         debug_assert!(max_capacity > 0, "max_capacity must be > 0");
         if kv_event_sink.is_some() {
@@ -68,6 +71,13 @@ impl ManualKvManager {
             None
         };
 
+        let g3_cache = if num_ssd_blocks > 0 {
+            tracing::info!("G3 (SSD) tier enabled: {num_ssd_blocks} blocks for DP rank {dp_rank}");
+            Some(HashCache::new(num_ssd_blocks))
+        } else {
+            None
+        };
+
         ManualKvManager {
             cache: HashCache::new(max_capacity),
             block_size,
@@ -75,6 +85,7 @@ impl ManualKvManager {
             dp_rank,
             next_event_id: 0,
             g2_cache,
+            g3_cache,
         }
     }
 
@@ -232,9 +243,94 @@ impl ManualKvManager {
             g2_free = g2_free,
             g2_inactive = g2_inactive,
             g2_total = g2.max_capacity(),
+            g3_free = self
+                .g3_cache
+                .as_ref()
+                .map_or(0, |g3| g3.max_capacity().saturating_sub(g3.num_inactive())),
+            g3_inactive = self.g3_cache.as_ref().map_or(0, |g3| g3.num_inactive()),
+            g3_total = self.g3_cache.as_ref().map_or(0, |g3| g3.max_capacity()),
             dp_rank = self.dp_rank,
             "KV cache trace"
         );
+    }
+
+    /// Log a G3 (SSD) tier trace event when `DYN_MOCKER_KV_CACHE_TRACE=1`.
+    fn trace_g3_event(
+        &self,
+        kv_event_name: &'static str,
+        kv_event_reason: &'static str,
+        source_tier: &'static str,
+        target_tier: &'static str,
+        block_id: u64,
+    ) {
+        if !*KV_CACHE_TRACE_ENABLED {
+            return;
+        }
+        let Some(ref g3) = self.g3_cache else {
+            return;
+        };
+        let g3_inactive = g3.num_inactive();
+        let g3_free = g3.max_capacity().saturating_sub(g3_inactive);
+        let g2_inactive = self.g2_cache.as_ref().map_or(0, |g2| g2.num_inactive());
+        let g2_total = self.g2_cache.as_ref().map_or(0, |g2| g2.max_capacity());
+        let g2_free = g2_total.saturating_sub(g2_inactive);
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        tracing::info!(
+            event = "kv_event",
+            kv_event_schema = KV_EVENT_SCHEMA,
+            kv_event_component = "kv_manager",
+            kv_event_phase = "tier_transition",
+            kv_event_name,
+            kv_event_reason,
+            source_tier,
+            target_tier,
+            timestamp_ms,
+            block_ids = ?vec![block_id],
+            block_size = self.block_size,
+            g1_free = self.cache.max_capacity()
+                .saturating_sub(self.cache.num_active())
+                .saturating_sub(self.cache.num_inactive()),
+            g1_active = self.cache.num_active(),
+            g1_inactive = self.cache.num_inactive(),
+            g1_total = self.cache.max_capacity(),
+            g2_free,
+            g2_inactive,
+            g2_total,
+            g3_free,
+            g3_inactive,
+            g3_total = g3.max_capacity(),
+            dp_rank = self.dp_rank,
+            "KV cache trace"
+        );
+    }
+
+    /// Offload a block from G2 inactive → G3 inactive. If G3 is full, evict
+    /// the G3 LRU block first.
+    fn offload_to_g3(&mut self, block: &UniqueBlock) {
+        let Some(ref mut g3) = self.g3_cache else {
+            return;
+        };
+
+        let mut g3_evicted_hash: Option<u64> = None;
+        if g3.is_at_capacity() {
+            if let Some(UniqueBlock::FullBlock(hash)) = g3.evict_inactive() {
+                g3_evicted_hash = Some(hash);
+            }
+        }
+
+        g3.insert_inactive(block.clone());
+
+        if let Some(hash) = g3_evicted_hash {
+            self.trace_g3_event("tier_eviction", "g3_eviction", "g3", "none", hash);
+        }
+
+        if let UniqueBlock::FullBlock(hash) = block {
+            self.trace_g3_event("tier_move", "g2_to_g3_offload", "g2", "g3", *hash);
+        }
     }
 
     /// Offload a block from G1 inactive → G2 inactive. If G2 is full, evict
@@ -243,32 +339,28 @@ impl ManualKvManager {
         let Some(ref mut g2) = self.g2_cache else {
             return;
         };
-        // If G2 is full, evict LRU from G2 (truly discard)
-        let mut g2_evicted_hash: Option<u64> = None;
+
+        // If G2 is full, evict LRU from G2 and cascade to G3 when enabled.
+        let mut g2_evicted_block: Option<UniqueBlock> = None;
         if g2.is_at_capacity() {
-            if let Some(UniqueBlock::FullBlock(hash)) = g2.evict_inactive() {
-                g2_evicted_hash = Some(hash);
+            if let Some(evicted) = g2.evict_inactive() {
+                g2_evicted_block = Some(evicted);
             }
         }
+
         g2.insert_inactive(block.clone());
+
         // Now trace (no more mutable borrow on g2)
-        if let Some(hash) = g2_evicted_hash {
-            self.trace_g2_event(
-                "tier_eviction",
-                "g2_eviction",
-                "g2",
-                "none",
-                hash,
-            );
+        if let Some(evicted) = g2_evicted_block {
+            if self.g3_cache.is_some() {
+                self.offload_to_g3(&evicted);
+            } else if let UniqueBlock::FullBlock(hash) = evicted {
+                self.trace_g2_event("tier_eviction", "g2_eviction", "g2", "none", hash);
+            }
         }
+
         if let UniqueBlock::FullBlock(hash) = block {
-            self.trace_g2_event(
-                "tier_move",
-                "g1_to_g2_offload",
-                "g1",
-                "g2",
-                *hash,
-            );
+            self.trace_g2_event("tier_move", "g1_to_g2_offload", "g1", "g2", *hash);
         }
     }
 
@@ -291,7 +383,7 @@ impl ManualKvManager {
                         None,
                         false,
                         None,
-                        Some("g2_eviction"),
+                        Some("g1_to_g2_offload"),
                     );
                 }
                 // Offload the evicted G1 block to G2
@@ -316,6 +408,49 @@ impl ManualKvManager {
                 *hash,
             );
         }
+        true
+    }
+
+    /// Try to onboard a block directly from G3 → G1 active.
+    /// Returns true if found in G3 and onboard succeeded.
+    fn try_onboard_from_g3(&mut self, block: &UniqueBlock) -> bool {
+        let Some(ref mut g3) = self.g3_cache else {
+            return false;
+        };
+
+        if !g3.remove_inactive(block) {
+            return false;
+        }
+
+        // Make room in G1 if needed.
+        if self.cache.is_at_capacity() {
+            if let Some(evicted) = self.cache.evict_inactive() {
+                if let UniqueBlock::FullBlock(evicted_hash) = &evicted {
+                    self.publish_kv_event(
+                        vec![*evicted_hash],
+                        &[],
+                        None,
+                        false,
+                        None,
+                        Some("g1_to_g2_offload"),
+                    );
+                }
+                self.offload_to_g2(&evicted);
+            } else {
+                // No inactive to evict and G1 is full — cannot onboard.
+                // Put it back in G3.
+                if let Some(ref mut g3_restore) = self.g3_cache {
+                    g3_restore.insert_inactive(block.clone());
+                }
+                return false;
+            }
+        }
+
+        self.cache.insert_active(block.clone(), 1);
+        if let UniqueBlock::FullBlock(hash) = block {
+            self.trace_g3_event("tier_move", "g3_to_g1_onboard", "g3", "g1", *hash);
+        }
+
         true
     }
 
@@ -345,11 +480,13 @@ impl KvBackend for ManualKvManager {
                 let mut g1_active_hits = Vec::<u64>::new();
                 let mut g1_inactive_hits = Vec::<u64>::new();
                 let mut g2_hits = Vec::<u64>::new();
+                let mut g3_hits = Vec::<u64>::new();
                 // (global_hash, local_hash, parent_hash) for blocks onboarded from G2.
                 // We must publish a Stored event for each so the router re-tracks them;
                 // without it, a subsequent eviction sends a Removed for an unknown hash,
                 // triggering "Failed to find block to remove" in the radix tree indexer.
                 let mut g2_onboard_data: Vec<(u64, BlockHash, Option<u64>)> = Vec::new();
+                let mut g3_onboard_data: Vec<(u64, BlockHash, Option<u64>)> = Vec::new();
 
                 let mut parent_block: Option<&UniqueBlock> = None;
                 for (i, hash) in hashes.iter().enumerate() {
@@ -380,6 +517,22 @@ impl KvBackend for ManualKvManager {
                             g2_hits.push(*h);
                             if i < local_hashes.len() {
                                 g2_onboard_data.push((*h, local_hashes[i], parent_hash_before_g2));
+                            }
+                        }
+                        parent_block = Some(hash);
+                        continue;
+                    }
+
+                    // Check G3 (SSD) tier before allocating a fresh block
+                    let parent_hash_before_g3 = match parent_block {
+                        Some(UniqueBlock::FullBlock(h)) => Some(*h),
+                        _ => None,
+                    };
+                    if self.try_onboard_from_g3(hash) {
+                        if let UniqueBlock::FullBlock(h) = hash {
+                            g3_hits.push(*h);
+                            if i < local_hashes.len() {
+                                g3_onboard_data.push((*h, local_hashes[i], parent_hash_before_g3));
                             }
                         }
                         parent_block = Some(hash);
@@ -444,6 +597,18 @@ impl KvBackend for ManualKvManager {
                         true,
                         None,
                         Some("g2_onboard_restore"),
+                    );
+                }
+
+                for (hash, local_hash, parent) in g3_onboard_data {
+                    let lh = [local_hash];
+                    self.publish_kv_event(
+                        vec![hash],
+                        &lh,
+                        parent,
+                        true,
+                        None,
+                        Some("g3_to_g1_onboard"),
                     );
                 }
 
@@ -560,6 +725,10 @@ impl KvBackend for ManualKvManager {
                 .g2_cache
                 .as_ref()
                 .is_some_and(|g2| g2.contains_inactive(&block))
+            || self
+                .g3_cache
+                .as_ref()
+                .is_some_and(|g3| g3.contains_inactive(&block))
     }
 
     fn num_g2_inactive_blocks(&self) -> usize {
@@ -575,6 +744,21 @@ impl KvBackend for ManualKvManager {
         self.g2_cache
             .as_ref()
             .is_some_and(|g2| g2.contains_inactive(&block))
+    }
+
+    fn num_g3_inactive_blocks(&self) -> usize {
+        self.g3_cache.as_ref().map_or(0, |g3| g3.num_inactive())
+    }
+
+    fn g3_max_capacity(&self) -> usize {
+        self.g3_cache.as_ref().map_or(0, |g3| g3.max_capacity())
+    }
+
+    fn is_block_in_g3(&self, seq_hash: u64) -> bool {
+        let block = UniqueBlock::FullBlock(seq_hash);
+        self.g3_cache
+            .as_ref()
+            .is_some_and(|g3| g3.contains_inactive(&block))
     }
 }
 
@@ -708,7 +892,7 @@ mod tests {
         // SAFETY: single-threaded test, no concurrent env access
         unsafe { std::env::set_var("DYN_MOCKER_KV_CACHE_TRACE", "1") };
 
-        let mut manager = ManualKvManager::new_with_event_sink(4, 16, None, 0, 2);
+        let mut manager = ManualKvManager::new_with_event_sink(4, 16, None, 0, 2, 0);
 
         // Verify G2 is configured
         assert_eq!(manager.g2_max_capacity(), 2);
@@ -783,5 +967,68 @@ mod tests {
         // G1 should be at capacity (4 blocks): the onboard of 0 might have evicted an inactive
         assert!(g1_inactive <= 4, "G1 inactive should not exceed capacity");
         assert!(g2_inactive >= 1, "G2 should have at least 1 block");
+    }
+
+    #[test]
+    fn test_g3_cascade_from_g2_when_full() {
+        let mut manager = ManualKvManager::new_with_event_sink(2, 16, None, 0, 1, 1);
+
+        fn use_blocks(manager: &mut ManualKvManager, ids: Vec<u64>) -> bool {
+            let blocks: Vec<_> = ids.iter().map(|&id| UniqueBlock::FullBlock(id)).collect();
+            let hashes: Vec<_> = ids.into_iter().collect();
+            manager.process(&MoveBlock::Use(blocks, hashes, vec![], None))
+        }
+
+        fn deref_blocks(manager: &mut ManualKvManager, ids: Vec<u64>) {
+            let blocks = ids.into_iter().map(UniqueBlock::FullBlock).collect();
+            manager.process(&MoveBlock::Deref(blocks));
+        }
+
+        // Fill G1 and mark blocks inactive.
+        assert!(use_blocks(&mut manager, vec![0, 1]));
+        deref_blocks(&mut manager, vec![0, 1]);
+
+        // First new block offloads one inactive block from G1 -> G2.
+        assert!(use_blocks(&mut manager, vec![2]));
+        assert!(manager.is_block_in_g2(0));
+        assert!(!manager.is_block_in_g3(0));
+
+        // Second new block causes another G1 offload. G2 is full, so prior G2 LRU cascades to G3.
+        assert!(use_blocks(&mut manager, vec![3]));
+        assert!(manager.is_block_in_g2(1));
+        assert!(manager.is_block_in_g3(0));
+        assert_eq!(manager.num_g2_inactive_blocks(), 1);
+        assert_eq!(manager.num_g3_inactive_blocks(), 1);
+    }
+
+    #[test]
+    fn test_g3_direct_onboard_to_g1() {
+        let mut manager = ManualKvManager::new_with_event_sink(2, 16, None, 0, 1, 1);
+
+        fn use_blocks(manager: &mut ManualKvManager, ids: Vec<u64>) -> bool {
+            let blocks: Vec<_> = ids.iter().map(|&id| UniqueBlock::FullBlock(id)).collect();
+            let hashes: Vec<_> = ids.into_iter().collect();
+            manager.process(&MoveBlock::Use(blocks, hashes, vec![], None))
+        }
+
+        fn deref_blocks(manager: &mut ManualKvManager, ids: Vec<u64>) {
+            let blocks = ids.into_iter().map(UniqueBlock::FullBlock).collect();
+            manager.process(&MoveBlock::Deref(blocks));
+        }
+
+        // Build up tiers so block 0 ends up in G3 and block 1 in G2.
+        assert!(use_blocks(&mut manager, vec![0, 1]));
+        deref_blocks(&mut manager, vec![0, 1]);
+        assert!(use_blocks(&mut manager, vec![2]));
+        assert!(use_blocks(&mut manager, vec![3]));
+        assert!(manager.is_block_in_g3(0));
+
+        // Make G1 blocks inactive so onboard can evict one inactive for space.
+        deref_blocks(&mut manager, vec![2, 3]);
+
+        // Reuse block 0; should onboard directly from G3 -> G1.
+        assert!(use_blocks(&mut manager, vec![0]));
+        assert!(manager.cache.contains_active(&UniqueBlock::FullBlock(0)));
+        assert!(!manager.is_block_in_g3(0));
     }
 }

@@ -261,6 +261,18 @@ pub struct MockEngineArgs {
     #[builder(default = "200.0")]
     #[validate(range(min = 0.0))]
     pub g2_transfer_bandwidth: f64,
+
+    /// Number of SSD (G3) blocks for tiered KV cache offloading.
+    /// When > 0, blocks evicted from G2 (DRAM) are offloaded to G3 (SSD)
+    /// instead of being discarded. Default: 0 (G3 disabled).
+    #[builder(default = "0")]
+    pub num_ssd_blocks: usize,
+
+    /// G3 ↔ G1 transfer bandwidth in GB/s for simulated direct onboard latency.
+    /// Default: 7.0 (typical NVMe Gen4 sequential throughput).
+    #[builder(default = "7.0")]
+    #[validate(range(min = 0.0))]
+    pub g3_transfer_bandwidth: f64,
 }
 
 impl Default for MockEngineArgs {
@@ -321,6 +333,8 @@ impl MockEngineArgs {
             "eviction_backend",
             "num_dram_blocks",
             "g2_transfer_bandwidth",
+            "num_ssd_blocks",
+            "g3_transfer_bandwidth",
         ]
         .iter()
         .cloned()
@@ -513,6 +527,20 @@ impl MockEngineArgs {
             && let Some(num) = value.as_f64()
         {
             builder = builder.g2_transfer_bandwidth(num);
+        }
+
+        // Parse num_ssd_blocks
+        if let Some(value) = extra_args.get("num_ssd_blocks")
+            && let Some(num) = value.as_u64()
+        {
+            builder = builder.num_ssd_blocks(num as usize);
+        }
+
+        // Parse g3_transfer_bandwidth
+        if let Some(value) = extra_args.get("g3_transfer_bandwidth")
+            && let Some(num) = value.as_f64()
+        {
+            builder = builder.g3_transfer_bandwidth(num);
         }
 
         // Parse eviction_backend
