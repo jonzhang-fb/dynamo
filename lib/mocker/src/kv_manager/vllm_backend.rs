@@ -30,6 +30,28 @@ static KV_CACHE_TRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
 
 const KV_EVENT_SCHEMA: &str = "v1";
 
+#[derive(Clone, Copy)]
+struct TierSnapshot {
+    g1_free: usize,
+    g1_active: usize,
+    g1_inactive: usize,
+    g1_total: usize,
+    g2_free: usize,
+    g2_inactive: usize,
+    g2_total: usize,
+    g3_free: usize,
+    g3_inactive: usize,
+    g3_total: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PendingG3Rewrite {
+    outgoing_reason: &'static str,
+    outgoing_block_id: u64,
+    outgoing_timestamp_ms: u64,
+    before: TierSnapshot,
+}
+
 pub struct ManualKvManager {
     cache: HashCache,
     block_size: usize,
@@ -40,6 +62,9 @@ pub struct ManualKvManager {
     g2_cache: Option<HashCache>,
     /// Optional G3 (SSD) tier for offloaded KV blocks.
     g3_cache: Option<HashCache>,
+    /// Tracks a pending "outgoing from G3" event to group with the next
+    /// g2_to_g3_offload into a single SSD rewrite event.
+    pending_g3_rewrite: Option<PendingG3Rewrite>,
 }
 
 impl ManualKvManager {
@@ -86,6 +111,37 @@ impl ManualKvManager {
             next_event_id: 0,
             g2_cache,
             g3_cache,
+            pending_g3_rewrite: None,
+        }
+    }
+
+    fn tier_snapshot(&self) -> TierSnapshot {
+        let g1_active = self.cache.num_active();
+        let g1_inactive = self.cache.num_inactive();
+        let g1_total = self.cache.max_capacity();
+        let g1_free = g1_total
+            .saturating_sub(g1_active)
+            .saturating_sub(g1_inactive);
+
+        let g2_inactive = self.g2_cache.as_ref().map_or(0, |g2| g2.num_inactive());
+        let g2_total = self.g2_cache.as_ref().map_or(0, |g2| g2.max_capacity());
+        let g2_free = g2_total.saturating_sub(g2_inactive);
+
+        let g3_inactive = self.g3_cache.as_ref().map_or(0, |g3| g3.num_inactive());
+        let g3_total = self.g3_cache.as_ref().map_or(0, |g3| g3.max_capacity());
+        let g3_free = g3_total.saturating_sub(g3_inactive);
+
+        TierSnapshot {
+            g1_free,
+            g1_active,
+            g1_inactive,
+            g1_total,
+            g2_free,
+            g2_inactive,
+            g2_total,
+            g3_free,
+            g3_inactive,
+            g3_total,
         }
     }
 
@@ -256,7 +312,7 @@ impl ManualKvManager {
 
     /// Log a G3 (SSD) tier trace event when `DYN_MOCKER_KV_CACHE_TRACE=1`.
     fn trace_g3_event(
-        &self,
+        &mut self,
         kv_event_name: &'static str,
         kv_event_reason: &'static str,
         source_tier: &'static str,
@@ -266,14 +322,10 @@ impl ManualKvManager {
         if !*KV_CACHE_TRACE_ENABLED {
             return;
         }
-        let Some(ref g3) = self.g3_cache else {
+        let Some(_) = self.g3_cache else {
             return;
         };
-        let g3_inactive = g3.num_inactive();
-        let g3_free = g3.max_capacity().saturating_sub(g3_inactive);
-        let g2_inactive = self.g2_cache.as_ref().map_or(0, |g2| g2.num_inactive());
-        let g2_total = self.g2_cache.as_ref().map_or(0, |g2| g2.max_capacity());
-        let g2_free = g2_total.saturating_sub(g2_inactive);
+        let snapshot = self.tier_snapshot();
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -291,18 +343,80 @@ impl ManualKvManager {
             timestamp_ms,
             block_ids = ?vec![block_id],
             block_size = self.block_size,
-            g1_free = self.cache.max_capacity()
-                .saturating_sub(self.cache.num_active())
-                .saturating_sub(self.cache.num_inactive()),
-            g1_active = self.cache.num_active(),
-            g1_inactive = self.cache.num_inactive(),
-            g1_total = self.cache.max_capacity(),
-            g2_free,
-            g2_inactive,
-            g2_total,
-            g3_free,
-            g3_inactive,
-            g3_total = g3.max_capacity(),
+            g1_free = snapshot.g1_free,
+            g1_active = snapshot.g1_active,
+            g1_inactive = snapshot.g1_inactive,
+            g1_total = snapshot.g1_total,
+            g2_free = snapshot.g2_free,
+            g2_inactive = snapshot.g2_inactive,
+            g2_total = snapshot.g2_total,
+            g3_free = snapshot.g3_free,
+            g3_inactive = snapshot.g3_inactive,
+            g3_total = snapshot.g3_total,
+            dp_rank = self.dp_rank,
+            "KV cache trace"
+        );
+
+        if kv_event_reason == "g3_eviction" || kv_event_reason == "g3_to_g1_onboard" {
+            self.pending_g3_rewrite = Some(PendingG3Rewrite {
+                outgoing_reason: kv_event_reason,
+                outgoing_block_id: block_id,
+                outgoing_timestamp_ms: timestamp_ms,
+                before: snapshot,
+            });
+            return;
+        }
+
+        if kv_event_reason != "g2_to_g3_offload" {
+            return;
+        }
+
+        let Some(pending) = self.pending_g3_rewrite.take() else {
+            return;
+        };
+
+        let rewrite_reason = match pending.outgoing_reason {
+            "g3_eviction" => "g3_evict_then_g2_to_g3_offload",
+            "g3_to_g1_onboard" => "g3_to_g1_onboard_then_g2_to_g3_offload",
+            _ => return,
+        };
+
+        tracing::info!(
+            event = "kv_event",
+            kv_event_schema = KV_EVENT_SCHEMA,
+            kv_event_component = "kv_manager",
+            kv_event_phase = "tier_transition",
+            kv_event_name = "tier_rewrite",
+            kv_event_reason = rewrite_reason,
+            outgoing_kv_event_reason = pending.outgoing_reason,
+            source_tier = "g3",
+            target_tier = "g3",
+            timestamp_ms,
+            outgoing_timestamp_ms = pending.outgoing_timestamp_ms,
+            rewrite_outgoing_block_id = pending.outgoing_block_id,
+            rewrite_incoming_block_id = block_id,
+            block_ids = ?vec![pending.outgoing_block_id, block_id],
+            block_size = self.block_size,
+            g1_free_before = pending.before.g1_free,
+            g1_active_before = pending.before.g1_active,
+            g1_inactive_before = pending.before.g1_inactive,
+            g1_total_before = pending.before.g1_total,
+            g2_free_before = pending.before.g2_free,
+            g2_inactive_before = pending.before.g2_inactive,
+            g2_total_before = pending.before.g2_total,
+            g3_free_before = pending.before.g3_free,
+            g3_inactive_before = pending.before.g3_inactive,
+            g3_total_before = pending.before.g3_total,
+            g1_free_after = snapshot.g1_free,
+            g1_active_after = snapshot.g1_active,
+            g1_inactive_after = snapshot.g1_inactive,
+            g1_total_after = snapshot.g1_total,
+            g2_free_after = snapshot.g2_free,
+            g2_inactive_after = snapshot.g2_inactive,
+            g2_total_after = snapshot.g2_total,
+            g3_free_after = snapshot.g3_free,
+            g3_inactive_after = snapshot.g3_inactive,
+            g3_total_after = snapshot.g3_total,
             dp_rank = self.dp_rank,
             "KV cache trace"
         );
